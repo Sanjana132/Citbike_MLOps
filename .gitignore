@@ -29,3 +29,6 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# The original build brief - kept locally, deliberately not published.
+CLAUDE_CODE_BUILD_PROMPT.txt
