@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import Config, load_config
-from src.features.build_features import TARGET_COLUMN, TIME_KEY
+from src.features.build_features import ENTITY_KEY, TARGET_COLUMN, TIME_KEY
 from src.models.promote import Candidate
 
 logger = logging.getLogger(__name__)
@@ -104,21 +104,84 @@ class DeepDemandModel:
 
     # -- data preparation --------------------------------------------------
 
-    def _sequences(self, panel: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def prepend_context(
+        self, split: pd.DataFrame, history: pd.DataFrame | None
+    ) -> pd.DataFrame:
+        """Prefix each entity's split with its preceding ``sequence_length`` hours.
+
+        Without this, a split shorter than ``sequence_length`` yields **zero**
+        sequences and the model silently scores nothing. The validation split is
+        exactly 168 hours and the sequence length is 168, so it produced no
+        predictions at all and early stopping fell back to the training loss.
+
+        Prefixing also matches how serving works: the sequence for hour *t* comes
+        from the history before *t*, which may sit in an earlier split.
+        """
+        return self.prepend_context_with_mask(split, history)[0]
+
+    def prepend_context_with_mask(
+        self, split: pd.DataFrame, history: pd.DataFrame | None
+    ) -> tuple[pd.DataFrame, pd.Series]:
+        """As :meth:`prepend_context`, plus a mask marking the split's own rows.
+
+        The marker is attached before concatenating rather than recovered
+        afterwards by comparing timestamps - context and split can share hours
+        across entities, so a timestamp comparison would mislabel rows.
+        """
+        marker = "_is_split_row"
+        tagged_split = split.assign(**{marker: True})
+        if history is None or history.empty:
+            combined = tagged_split.reset_index(drop=True)
+            return combined.drop(columns=marker), combined[marker]
+
+        tails = (
+            history.sort_values([ENTITY_KEY, TIME_KEY])
+            .groupby(ENTITY_KEY, observed=True, group_keys=False)
+            .tail(self.sequence_length)
+            .assign(**{marker: False})
+        )
+        combined = (
+            pd.concat([tails, tagged_split], ignore_index=True)
+            .sort_values([ENTITY_KEY, TIME_KEY])
+            .reset_index(drop=True)
+        )
+        return combined.drop(columns=marker), combined[marker]
+
+    def _sequences(
+        self,
+        panel: pd.DataFrame,
+        *,
+        target_mask: pd.Series | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Build (sequence, covariates, target) arrays from a feature panel.
 
         The demand sequence is reconstructed from the panel's own history per
         entity, using only rows strictly before the target hour.
+
+        ``target_mask`` restricts which rows become training targets while still
+        allowing earlier rows to serve as sequence context - that is how a
+        context-prefixed split is scored on its own rows only.
         """
         sequences, covariates, targets = [], [], []
         length = self.sequence_length
 
-        for _, group in panel.groupby("entity_id", observed=True):
+        working = panel
+        if target_mask is not None:
+            working = panel.assign(_is_target=target_mask.to_numpy())
+
+        for _, group in working.groupby(ENTITY_KEY, observed=True):
             group = group.sort_values(TIME_KEY)
             demand = group[TARGET_COLUMN].to_numpy(dtype=float)
             covariate_matrix = group[self.covariates].to_numpy(dtype=float)
+            is_target = (
+                group["_is_target"].to_numpy(dtype=bool)
+                if target_mask is not None
+                else np.ones(len(group), dtype=bool)
+            )
 
             for index in range(length, len(group)):
+                if not is_target[index]:
+                    continue
                 window = demand[index - length : index]
                 if np.isnan(window).any() or np.isnan(demand[index]):
                     continue
@@ -152,7 +215,19 @@ class DeepDemandModel:
         self.covariate_std = np.where(x_cov.std(axis=0) < 1e-6, 1.0, x_cov.std(axis=0))
         self.target_scale = float(max(y.mean(), 1.0))
 
-        v_seq, v_cov, v_y = self._sequences(validation_panel)
+        # Validation is scored with training history prefixed, so a split
+        # shorter than sequence_length still produces sequences.
+        validation_context, validation_mask = self.prepend_context_with_mask(
+            validation_panel, train_panel
+        )
+        v_seq, v_cov, v_y = self._sequences(
+            validation_context, target_mask=validation_mask
+        )
+        if len(v_y) == 0:
+            logger.warning(
+                "Validation produced no sequences even with context; early "
+                "stopping will fall back to the training loss"
+            )
 
         params = self._config.get_path("models.lstm", {}) or {}
         batch_size = int(params.get("batch_size", 256))
@@ -225,6 +300,24 @@ class DeepDemandModel:
                 torch.from_numpy((x_cov - self.covariate_mean) / self.covariate_std),
             )
         return np.clip(predictions.numpy() * self.target_scale, 0.0, None)
+
+    def predict_split(
+        self, split: pd.DataFrame, history: pd.DataFrame | None = None
+    ) -> pd.Series:
+        """Predict a split, drawing sequence context from preceding data.
+
+        Returns a series aligned to ``split.index``; rows that still lack enough
+        history come back as NaN and are excluded from scoring.
+        """
+        combined = self.prepend_context(split, history)
+        predictions = self.predict_panel(combined)
+        scored = combined[[ENTITY_KEY, TIME_KEY]].assign(_pred=predictions.to_numpy())
+        merged = split[[ENTITY_KEY, TIME_KEY]].merge(
+            scored.drop_duplicates(subset=[ENTITY_KEY, TIME_KEY]),
+            on=[ENTITY_KEY, TIME_KEY],
+            how="left",
+        )
+        return pd.Series(merged["_pred"].to_numpy(), index=split.index)
 
     def predict_panel(self, panel: pd.DataFrame) -> pd.Series:
         """Predict for a feature panel, returning a series aligned to its index.
@@ -358,9 +451,14 @@ def train_deep_model(
         # Scored through predict_panel so the sequence is built from real
         # history rather than reconstructed from lag columns.
         metrics: dict[str, float] = {}
+        contexts = {
+            "validation": dataset.train,
+            # Test draws context from everything chronologically before it.
+            "test": pd.concat([dataset.train, dataset.validation], ignore_index=True),
+        }
         for split_name, prefix in (("validation", "val"), ("test", "test")):
             split = getattr(dataset, split_name)
-            predictions = model.predict_panel(split)
+            predictions = model.predict_split(split, contexts[split_name])
             usable = predictions.notna()
             if not usable.any():
                 logger.error("Deep model produced no usable predictions on %s", split_name)

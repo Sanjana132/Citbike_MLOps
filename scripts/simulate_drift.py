@@ -76,6 +76,15 @@ def emit_baseline(config, hours: int = 30) -> dict:
     features = feature_columns(config)
     predictions = bundle.model.predict(recent[features])
 
+    # The monitor's rolling window is measured backwards from *now*, but the
+    # historical backfill ends weeks earlier. Timestamps are shifted forward so
+    # the simulated rows land inside the window the monitor actually inspects.
+    # This is a demo tool writing synthetic rows - the shift is part of the
+    # fabrication, not a transformation of real observations.
+    shift = _shift_to_recent(recent[TIME_KEY])
+    recent[TIME_KEY] = recent[TIME_KEY] + shift
+    logger.info("Shifting simulated rows forward by %s to reach the monitoring window", shift)
+
     write_predictions(
         pd.DataFrame(
             {
@@ -89,17 +98,39 @@ def emit_baseline(config, hours: int = 30) -> dict:
     )
     write_features(recent[["entity_id", TIME_KEY] + features])
 
-    # Realised demand for these hours: the observed values the panel was built
-    # from, written back at station granularity so the monitor's own join works.
-    realised = history.departures[
-        history.departures["hour_ts"].isin(recent[TIME_KEY].unique())
-    ].copy()
+    # Realised demand for those hours, written at station granularity so the
+    # monitor's own prediction/actual join does the aggregation itself.
+    hours_in_window = set(recent[TIME_KEY].unique())
+    realised = history.departures.copy()
+    realised["hour_ts"] = realised["hour_ts"] + shift
+    realised = realised[realised["hour_ts"].isin(hours_in_window)]
     write_hourly_departures(
         realised.assign(label_source="gbfs_proxy"), label_source="gbfs_proxy"
     )
 
-    logger.info("Baseline: %d predictions over %d hours", len(recent), recent[TIME_KEY].nunique())
-    return {"rows": len(recent), "hours": int(recent[TIME_KEY].nunique())}
+    logger.info(
+        "Baseline: %d predictions and %d realised rows over %d hours",
+        len(recent), len(realised), recent[TIME_KEY].nunique(),
+    )
+    return {
+        "predictions": len(recent),
+        "realised_rows": len(realised),
+        "hours": int(recent[TIME_KEY].nunique()),
+        "window_end": str(recent[TIME_KEY].max()),
+    }
+
+
+def _shift_to_recent(timestamps: pd.Series) -> pd.Timedelta:
+    """Whole-week offset that moves a window to end at the current hour.
+
+    A multiple of 168 hours is used so hour-of-day and day-of-week - the two
+    strongest features - are preserved. Shifting by an arbitrary offset would
+    itself look like drift and confuse the very signal being demonstrated.
+    """
+    now = pd.Timestamp(datetime.now(tz=UTC)).tz_localize(None).floor("h")
+    raw_gap = now - pd.Timestamp(timestamps.max())
+    weeks = int(raw_gap / pd.Timedelta(days=7))
+    return pd.Timedelta(days=7 * max(weeks, 0))
 
 
 def inject_drift(config, shift: float = 2.5, hours: int = 24) -> dict:

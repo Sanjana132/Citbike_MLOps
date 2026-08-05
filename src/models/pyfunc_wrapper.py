@@ -65,7 +65,10 @@ class DemandModelWrapper(mlflow.pyfunc.PythonModel):
                 f"Input is missing {len(missing)} feature column(s) required by this "
                 f"model: {missing[:10]}"
             )
-        matrix = model_input[self.features]
+        # Everything downstream is numeric, so coerce to float. This keeps a
+        # caller that supplies ints (or strings from a JSON payload) working
+        # rather than failing deep inside the estimator.
+        matrix = model_input[self.features].astype("float64")
         raw = self._booster.predict(matrix)
         return np.clip(np.asarray(raw, dtype=float), 0.0, None)
 

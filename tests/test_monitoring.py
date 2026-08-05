@@ -188,3 +188,81 @@ def test_psi_handles_degenerate_input():
     constant = pd.Series([5.0] * 100)
     assert population_stability_index(constant, constant) == 0.0
     assert population_stability_index(pd.Series([1.0]), pd.Series([2.0])) == 0.0
+
+
+# --------------------------------------------------------------------------
+# Retrain cooldown
+# --------------------------------------------------------------------------
+
+def _metrics_history(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(rows, columns=["computed_at", "breached", "breach_reason"])
+
+
+def test_cooldown_blocks_a_second_retrain_too_soon(monkeypatch, config):
+    """Drift persists until a new model serves; without this the queue never drains."""
+    from src.monitoring import pipeline
+    from src.storage import db
+
+    recent = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=1)
+    monkeypatch.setattr(
+        db, "read_model_metrics",
+        lambda limit=500, engine=None: _metrics_history(
+            [{"computed_at": recent, "breached": True, "breach_reason": "drift: 80%"}]
+        ),
+    )
+    remaining = pipeline._cooldown_remaining_hours(config)
+    cooldown = float(config.get_path("monitoring.retrain_cooldown_hours"))
+    assert remaining is not None
+    assert remaining == pytest.approx(cooldown - 1.0, abs=0.2)
+
+
+def test_cooldown_expires(monkeypatch, config):
+    from src.monitoring import pipeline
+    from src.storage import db
+
+    cooldown = float(config.get_path("monitoring.retrain_cooldown_hours"))
+    old = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(hours=cooldown + 2)
+    monkeypatch.setattr(
+        db, "read_model_metrics",
+        lambda limit=500, engine=None: _metrics_history(
+            [{"computed_at": old, "breached": True, "breach_reason": "drift: 80%"}]
+        ),
+    )
+    assert pipeline._cooldown_remaining_hours(config) == 0.0
+
+
+def test_suppressed_cycles_do_not_extend_their_own_cooldown(monkeypatch, config):
+    """A cycle blocked by the cooldown must not reset the clock."""
+    from src.monitoring import pipeline
+    from src.storage import db
+
+    recent = pd.Timestamp.utcnow().tz_localize(None) - pd.Timedelta(minutes=10)
+    monkeypatch.setattr(
+        db, "read_model_metrics",
+        lambda limit=500, engine=None: _metrics_history(
+            [{"computed_at": recent, "breached": False,
+              "breach_reason": "drift: 80%; [suppressed] cooldown remaining"}]
+        ),
+    )
+    assert pipeline._cooldown_remaining_hours(config) is None
+
+
+def test_no_history_means_no_cooldown(monkeypatch, config):
+    """A first-ever retrain must never be blocked."""
+    from src.monitoring import pipeline
+    from src.storage import db
+
+    monkeypatch.setattr(db, "read_model_metrics", lambda limit=500, engine=None: pd.DataFrame())
+    assert pipeline._cooldown_remaining_hours(config) is None
+
+
+def test_cooldown_fails_open_on_a_database_error(monkeypatch, config):
+    """Never let a monitoring lookup failure block retraining entirely."""
+    from src.monitoring import pipeline
+    from src.storage import db
+
+    def boom(limit=500, engine=None):
+        raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr(db, "read_model_metrics", boom)
+    assert pipeline._cooldown_remaining_hours(config) is None

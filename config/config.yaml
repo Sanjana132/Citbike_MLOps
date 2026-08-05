@@ -124,10 +124,47 @@ serving:
 monitoring:
   # monitor_dag triggers retrain_dag when either threshold is breached.
   rolling_mae_window_hours: 24
-  mae_threshold: 4.0                  # absolute rolling MAE ceiling
-  mae_degradation_ratio: 1.5          # or: 1.5x the training-time holdout MAE
+
+  # Absolute rolling-MAE ceiling. This is a BACKSTOP, not the primary rule, and
+  # it must be set on the scale of the target: at cluster granularity mean
+  # demand is ~161 departures/hour and the trained holdout MAE is ~24.6. The
+  # value below is the seasonal-naive baseline MAE (~46) - a model worse than
+  # "same hour last week" is not earning its keep, whatever else is true.
+  # Raise this if you switch features.granularity to "station", where the
+  # per-entity target is roughly 50x smaller.
+  mae_threshold: 45.0
+
+  # The primary, scale-free rule: retrain when the model is materially worse
+  # than it was on its own training holdout.
+  mae_degradation_ratio: 1.5
+
   drift_share_threshold: 0.3          # share of drifted features (Evidently)
   min_samples_for_evaluation: 200
+
+  # Minimum gap between automatic retrains. Drift usually persists until a new
+  # model is serving, so an hourly monitor would queue a fresh retrain every
+  # hour and build a backlog that never drains - observed on this stack before
+  # the cooldown existed. Retraining cannot fix drift faster than it takes to
+  # run, so asking more often than this is wasted compute.
+  retrain_cooldown_hours: 6
+
+  # Deterministic functions of the timestamp are excluded from drift detection.
+  # A 24-hour serving window covers one day of the week and the training
+  # reference covers nine weeks, so these columns ALWAYS register as "drifted"
+  # regardless of whether anything real changed. Including them made the drift
+  # share fire at 77% on a clean baseline. Genuine drift shows up in the lag,
+  # weather and entity features, which are not determined by the clock.
+  drift_exclude_features:
+    - hour
+    - hour_sin
+    - hour_cos
+    - day_of_week
+    - dow_sin
+    - dow_cos
+    - is_weekend
+    - is_holiday
+    - month
+    - season
 
 ingestion:
   poll_interval_minutes: 5

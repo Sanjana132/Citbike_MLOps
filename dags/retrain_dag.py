@@ -12,6 +12,8 @@ ground truth wins.
 
 from __future__ import annotations
 
+import logging
+
 import pendulum
 from airflow.decorators import dag, task
 
@@ -32,18 +34,28 @@ config = load_config()
 )
 def retrain_dag():
     @task
-    def train_and_promote(params: dict | None = None) -> dict:
+    def train_and_promote() -> dict:
         """Train every configured candidate and promote only a clear winner.
 
         ``run_training`` handles the comparison; a challenger that fails to beat
         the champion by the configured margin leaves production untouched.
+
+        Overrides arrive through ``dag_run.conf`` - that is how ``monitor_dag``
+        requests a blended retrain when it detects drift. The conf has to be
+        pulled from the runtime context explicitly; a plain function argument is
+        never populated from it.
         """
+        from airflow.operators.python import get_current_context
+
         from src.models.train import run_training
 
-        params = params or {}
+        conf = (get_current_context().get("dag_run").conf or {}) if get_current_context().get("dag_run") else {}
+        source = conf.get("source", "blend")
+        logging.info("Retraining with source=%s (conf=%s)", source, conf)
+
         result = run_training(
-            source=params.get("source", "blend"),
-            window_days=params.get("window_days"),
+            source=source,
+            window_days=conf.get("window_days"),
             config=config,
             promote=True,
         )

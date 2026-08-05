@@ -148,7 +148,15 @@ def compute_drift(
             reason=f"insufficient current rows ({len(current)} < {min_rows})",
         )
 
-    features = [f for f in _numeric_features(reference) if f in current.columns]
+    # Calendar features are deterministic functions of the timestamp, so a short
+    # current window differs from a long reference by construction. Comparing
+    # them measures the window sizes, not the data. See the config comment.
+    excluded = set(cfg.get_path("monitoring.drift_exclude_features", []) or [])
+    features = [
+        f
+        for f in _numeric_features(reference)
+        if f in current.columns and f not in excluded
+    ]
     if not features:
         return DriftReport(0.0, False, 0, 0, evaluated=False, reason="no shared numeric features")
 

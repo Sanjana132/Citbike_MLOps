@@ -21,6 +21,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+import pandas as pd
 
 from src.config import Config, load_config
 
@@ -40,6 +43,47 @@ class MonitoringOutcome:
         if not self.reasons:
             return "No retraining trigger fired"
         return "; ".join(self.reasons)
+
+
+def _cooldown_remaining_hours(config: Config) -> float | None:
+    """Hours left before another automatic retrain is allowed.
+
+    Uses the most recent monitoring row that actually triggered a retrain.
+    Returns ``None`` when the cooldown cannot be determined - and in that case
+    the caller proceeds, because failing open on a monitoring lookup is better
+    than never retraining at all.
+    """
+    cooldown_hours = float(config.get_path("monitoring.retrain_cooldown_hours", 0) or 0)
+    if cooldown_hours <= 0:
+        return None
+
+    try:
+        from src.storage.db import read_model_metrics
+
+        history = read_model_metrics(limit=200)
+        if history.empty or "breached" not in history.columns:
+            return None
+
+        triggered = history[history["breached"].fillna(False).astype(bool)]
+        # Rows suppressed by a previous cooldown did not cause a retrain, so
+        # they must not extend the cooldown window themselves.
+        if "breach_reason" in triggered.columns:
+            triggered = triggered[
+                ~triggered["breach_reason"].fillna("").str.contains(r"\[suppressed\]")
+            ]
+        if triggered.empty:
+            return None
+
+        last = pd.to_datetime(triggered["computed_at"]).max()
+        if pd.isna(last):
+            return None
+        if last.tzinfo is not None:
+            last = last.tz_convert("UTC").tz_localize(None)
+        elapsed = (datetime.now(tz=UTC).replace(tzinfo=None) - last).total_seconds() / 3600.0
+        return max(0.0, cooldown_hours - elapsed)
+    except Exception as exc:  # noqa: BLE001 - fail open, never block retraining
+        logger.warning("Could not evaluate the retrain cooldown (%s); allowing", exc)
+        return None
 
 
 def run_monitoring_cycle(config: Config | None = None) -> MonitoringOutcome:
@@ -80,8 +124,25 @@ def run_monitoring_cycle(config: Config | None = None) -> MonitoringOutcome:
     except Exception as exc:  # noqa: BLE001 - a drift failure must not block the error trigger
         logger.error("Drift evaluation failed: %s", exc)
 
+    # --- cooldown ----------------------------------------------------------
+    # Drift persists until a retrained model is actually serving, so without a
+    # cooldown an hourly monitor queues a retrain every hour and builds a
+    # backlog that never drains.
+    should_retrain = bool(reasons)
+    if should_retrain:
+        remaining = _cooldown_remaining_hours(cfg)
+        if remaining is not None and remaining > 0:
+            should_retrain = False
+            # The row is persisted with breached=False and a "[suppressed]"
+            # reason, so a suppressed cycle never extends its own cooldown.
+            reasons.append(
+                f"[suppressed] a retrain was already triggered recently; "
+                f"{remaining:.1f}h of cooldown remaining"
+            )
+            logger.info("Retrain trigger suppressed by cooldown (%.1fh remaining)", remaining)
+
     outcome = MonitoringOutcome(
-        should_retrain=bool(reasons),
+        should_retrain=should_retrain,
         reasons=reasons,
         accuracy={
             "evaluated": accuracy.evaluated,

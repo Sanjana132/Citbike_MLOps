@@ -183,7 +183,13 @@ def train_lightgbm_candidate(
                 artifact_path="model",
                 python_model=DemandModelWrapper(),
                 artifacts=artifacts,
-                input_example=x_val.head(5),
+                # Cast to float64 so the inferred signature declares every
+                # feature as a double. With integer columns, MLflow's schema
+                # enforcement rejects perfectly valid input that arrived as
+                # float - which is exactly what happens to features read back
+                # out of the JSONB features table. MLflow warns about this
+                # itself at log time.
+                input_example=x_val.head(5).astype("float64"),
                 code_paths=["src"],
             )
 

@@ -140,13 +140,41 @@ curl -X POST http://localhost:8000/predict \
 ### Demonstrating the closed loop
 
 ```bash
-python -m scripts.simulate_drift --baseline        # serve clean predictions
-python -m scripts.simulate_drift --inject --shift 2.5   # shift the distribution
-python -m scripts.simulate_drift --check           # monitoring verdict
+make demo-drift        # baseline -> inject -> monitoring verdict
 ```
 
-Then unpause `monitor_dag` in Airflow and watch it trigger `retrain_dag`.
-`--reset` removes everything the simulation wrote.
+or step by step:
+
+```bash
+python -m scripts.simulate_drift --baseline             # serve predictions
+python -m scripts.simulate_drift --inject --shift 3.0   # shift the distribution
+python -m scripts.simulate_drift --check                # monitoring verdict
+```
+
+Then unpause `monitor_dag` in Airflow. `--reset` removes everything the
+simulation wrote.
+
+**Verified on this stack.** `monitor_dag` ran, evaluated, and triggered
+retraining with no human involved:
+
+```
+Rolling MAE=23.844 over 838 samples; breached=False
+Monitoring cycle: should_retrain=True | drift: 69% of features drifted
+  (threshold 30%); worst: ['lag_1h','lag_2h','lag_3h','lag_24h','lag_168h']
+{branch.py:38} Branch into trigger_retrain
+{skipmixin.py:233} Following branch ('trigger_retrain',)
+{skipmixin.py:281} Skipping tasks [('no_action', -1)]
+```
+
+`retrain_dag` runs were then created by `TriggerDagRunOperator`. Note that the
+error trigger correctly did **not** fire — rolling MAE (23.84) was slightly
+*better* than the training holdout MAE (24.57) — while the drift trigger did.
+That is the complementarity the two-trigger design is for.
+
+Because the simulation's timestamps are historical and the monitor's window is
+measured backwards from now, `simulate_drift` shifts its rows forward by a whole
+number of weeks (preserving hour-of-day and day-of-week). It fabricates rows by
+design; never point it at a real deployment.
 
 ---
 
@@ -174,6 +202,28 @@ random split on a time series lets the model see `t+1` while predicting `t`.
 **Promotion needs a 2% margin.** Holdout MAE wobbles run-to-run from noise
 alone; promoting on any improvement would churn production daily for no real
 gain and make every incident harder to explain.
+
+**Monitoring thresholds are calibrated to this target, and that mattered.** The
+first run of the loop fired on *clean* baseline data, for two reasons worth
+recording:
+
+- An absolute MAE ceiling of 4.0 is meaningless when mean demand is ~161
+  departures per cluster-hour and the trained model's own holdout MAE is 24.6.
+  The ceiling is now the seasonal-naive baseline (~46): if the model is worse
+  than "same hour last week", it has stopped earning its keep. The primary rule
+  is the scale-free one — degradation relative to the model's own holdout.
+- **Calendar features are excluded from drift detection.** `hour`, `hour_sin`,
+  `dow_sin` and friends are deterministic functions of the timestamp, so a
+  24-hour serving window differs from a nine-week training reference *by
+  construction*. They were responsible for most of an apparent 77% drift share
+  on data that had not drifted at all. Genuine drift lives in the lag, weather
+  and entity features, which the clock does not determine.
+
+**The drift that remained after that fix was real.** Late-June demand runs 1.22x
+the April–early-June training average (7,523 vs 6,189 departures/hour
+system-wide) at 26.9 °C versus 16.8 °C. Serving late-June traffic from a model
+trained on spring data genuinely warrants a retrain — a true positive, verified
+against the data rather than assumed.
 
 **Clustering over per-station.** Per-station hourly demand is mostly zeros
 overnight, which makes the target noisy and evaluation meaningless. Configurable
