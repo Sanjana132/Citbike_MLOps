@@ -80,6 +80,27 @@ This is a **proxy**, and it is wrong in knowable ways:
 | **Missed polls** | Delta spans an unknown period. | Pairs dropped beyond `max_interval_gap_minutes`. |
 | **Partial hours** | 3 intervals summed as a full hour understates it. | Station-hours below 50% snapshot coverage are dropped. |
 
+### How far off is it, actually?
+
+Measured on this stack against real GBFS traffic, rather than asserted:
+
+| | value |
+|---|---|
+| Snapshot pairs usable after corrections | **9,472 / 9,852 (96.1%)** |
+| Pairs rejected (`is_renting = 0`) | 380 |
+| Proxy-implied system rate at ~00:00 local | **2,839 departures/hour** |
+| True rate at 00:00 from trip CSVs (3-month mean) | **2,379 departures/hour** |
+| Ratio | **1.19x — the proxy *overstates* here** |
+
+The right order of magnitude, and wrong in the direction the theory predicts:
+overnight, rebalancing vans move more bikes than riders do, and a van emptying a
+dock is indistinguishable from a queue of customers. Netting pushes the other
+way and dominates at busy daytime hours, so the bias is not a constant you can
+calibrate away with a single factor.
+
+Treat this as a sanity check, not a validation study: it is one 16-minute window
+on one night compared against a three-month hourly average.
+
 **Consequences you must carry forward:**
 
 - The **initial model is trained on historical trip CSVs**, where every label is
@@ -279,23 +300,60 @@ Engineering notes worth knowing:
 
 **Limitations — the honest list.**
 
-1. **The demand proxy is biased low**, worst where demand is highest. See the
-   table above. This is inherent to inventory-derived labels.
+1. **The demand proxy is biased**, in both directions depending on time of day
+   (measured at 1.19x overnight; netting pulls the other way at peak). This is
+   inherent to inventory-derived labels and cannot be calibrated away with a
+   single factor.
 2. **Live rolling MAE is measured against that proxy**, so it tracks *change*
    rather than true accuracy.
-3. **Three months of training data** (Apr–Jun) means no seasonal coverage — the
+3. **`--source blend` does not work on this data yet.** Trip CSVs end
+   2026-06-30 and live ingestion began 2026-08-03, leaving a 33-day hole, so a
+   split window lands inside it and training aborts with a clear diagnostic. Use
+   `--source offline` until the ingestion DAG has bridged the gap. This is
+   deliberately a loud failure — see the gap-fill note below for what the
+   alternative cost.
+4. **Three months of training data** (Apr–Jun) means no seasonal coverage — the
    model has never seen winter, and `season` is nearly constant in training.
-4. **A single 14-day test window** carries real variance; there is no rolling-
+5. **A single 14-day test window** carries real variance; there is no rolling-
    origin backtest yet.
-5. **Cluster granularity hides per-station error.** 40 clusters averaging 58
+6. **Cluster granularity hides per-station error.** 40 clusters averaging 58
    stations each is coarse for operational rebalancing decisions.
-6. **The deep model is not fully servable.** The LSTM is trained, registered and
-   compared honestly, but the pyfunc path reconstructs its input sequence from
-   lag columns rather than true history. If it were promoted, serving would be
-   approximate — so LightGBM is the practical champion today.
-7. **NOAA precipitation is a probability, not an amount**, in the live path.
-8. **The API image is large** (~10 GB) because torch is installed to support a
-   promoted deep model.
+7. **The deep model is not fully servable.** The LSTM is trained, registered and
+   compared on an identical holdout, but the pyfunc serving path reconstructs
+   its input sequence from lag columns rather than from true history. If it were
+   promoted, serving would be approximate — so LightGBM is the practical
+   champion today.
+8. **NOAA precipitation is a probability, not an amount**, in the live path.
+9. **The API image is large** (~10 GB) because torch is installed so that a
+   promoted deep model can be loaded.
+10. **Airflow runs LocalExecutor on one host** with no resource isolation, so a
+    retrain competes for CPU with ingestion.
+
+### What running it actually caught
+
+Several defects were only visible once the system was live, and they are the
+kind that stay silent:
+
+- **Fabricated zero demand.** `complete_panel` filled every missing
+  (entity, hour) with 0. Across the 33-day hole between the historical backfill
+  and live ingestion, that invented **32,160 rows (26.6% of the panel)** of
+  fake zero demand. The validation window landed inside the hole, so it was all
+  zeros, the model trivially predicted zero, `val_mae` collapsed to **0.001** —
+  and `test_mae` came out at **20.70**, *better* than the honest 24.57, which
+  means the promotion rule would have shipped it. Now only gaps shorter than
+  `features.max_gap_fill_hours` are filled.
+- **The deep model scored nothing.** Validation is exactly 168 hours and the
+  LSTM's sequence length is 168, so zero sequences formed; the candidate logged
+  no usable predictions and early stopping silently fell back to training loss.
+  Splits now draw sequence context from preceding data (0 → 6,720 sequences).
+- **Monitoring fired on clean data**, from an absolute MAE ceiling set for the
+  wrong scale and from calendar features that drift by construction.
+- **A retrain storm**: drift persists until a new model serves, so an hourly
+  monitor queued a retrain every hour. Three had stacked up before the cooldown
+  was added.
+
+The suite is hermetic — verified by running it with `socket.connect` blocked,
+not merely asserted.
 
 **Roadmap.** Kubernetes deployment; Kafka for snapshot streaming; a dedicated
 feature store (Feast); rolling-origin backtesting; per-station modelling with a
