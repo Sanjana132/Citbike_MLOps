@@ -232,9 +232,14 @@ def build_feature_panel(
     panel = add_lag_features(panel, cfg)
     panel = add_calendar_features(panel, cfg)
 
-    entity_meta = entities.drop_duplicates(subset=ENTITY_KEY)[
-        [ENTITY_KEY] + ENTITY_FEATURES
-    ]
+    # Select only the entity columns actually present; any that are absent are
+    # filled with NaN below. Indexing the full list here would raise instead,
+    # making the documented tolerance a lie.
+    available = [c for c in ENTITY_FEATURES if c in entities.columns]
+    missing = [c for c in ENTITY_FEATURES if c not in entities.columns]
+    if missing:
+        logger.warning("Entity metadata is missing %s; those features will be NaN", missing)
+    entity_meta = entities.drop_duplicates(subset=ENTITY_KEY)[[ENTITY_KEY] + available]
     panel = panel.merge(entity_meta, on=ENTITY_KEY, how="left")
 
     if weather is not None and not weather.empty:

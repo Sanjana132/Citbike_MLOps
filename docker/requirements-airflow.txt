@@ -1,0 +1,13 @@
+# Project dependencies for the Airflow image.
+#
+# Deliberately NOT the full requirements.txt: Airflow ships its own pins for
+# pandas, SQLAlchemy, requests and PyYAML, and forcing this project's versions
+# on top of them breaks the scheduler. Only packages Airflow does not already
+# provide are listed, and versions are left loose enough for Airflow's
+# constraint solver to reconcile.
+lightgbm==4.7.0
+scikit-learn>=1.5
+holidays>=0.60
+mlflow>=2.19,<3
+evidently>=0.7,<0.8
+pyarrow>=17

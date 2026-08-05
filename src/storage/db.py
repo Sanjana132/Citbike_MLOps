@@ -14,14 +14,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from src.config import PROJECT_ROOT, Config, load_config
+from src.config import PROJECT_ROOT, Config
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +64,22 @@ def init_schema(engine: Engine | None = None) -> None:
             .replace("DOUBLE PRECISION", "REAL")
             .replace("NOW()", "CURRENT_TIMESTAMP")
         )
-    statements = [s.strip() for s in ddl.split(";") if s.strip() and not s.strip().startswith("--")]
     with engine.begin() as connection:
-        for statement in statements:
+        for statement in split_sql_statements(ddl):
             connection.execute(text(statement))
-    logger.info("Schema initialised (%d statements)", len(statements))
+    logger.info("Schema initialised from sql/init.sql")
+
+
+def split_sql_statements(ddl: str) -> list[str]:
+    """Split a DDL script into executable statements.
+
+    Line comments are stripped *before* splitting on semicolons. Splitting first
+    is wrong: prose in a comment can contain a semicolon (init.sql really does),
+    which cuts a statement in half and leaves the remainder of the comment
+    prepended to the next CREATE TABLE.
+    """
+    lines = [line for line in ddl.splitlines() if not line.strip().startswith("--")]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
 
 
 def _upsert(
@@ -99,10 +110,35 @@ def _upsert(
         f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders}) "
         f"ON CONFLICT ({conflict}) {action}"
     )
-    records = frame.astype(object).where(pd.notna(frame), None).to_dict(orient="records")
     with engine.begin() as connection:
-        connection.execute(statement, records)
-    return len(records)
+        connection.execute(statement, _to_records(frame))
+    return len(frame)
+
+
+def _to_records(frame: pd.DataFrame) -> list[dict]:
+    """Convert a frame to bind parameters every DBAPI driver accepts.
+
+    pandas ``Timestamp`` and numpy scalars survive ``astype(object)``. psycopg2
+    tolerates them, but sqlite3 raises "type 'Timestamp' is not supported", so
+    datetime columns are converted to plain Python datetimes and NaN/NaT to None.
+    """
+    prepared = frame.copy()
+    for column in prepared.columns:
+        if pd.api.types.is_datetime64_any_dtype(prepared[column]):
+            series = prepared[column]
+            # sqlite cannot bind tz-aware datetimes either; normalise to naive UTC.
+            if isinstance(series.dtype, pd.DatetimeTZDtype):
+                series = series.dt.tz_convert("UTC").dt.tz_localize(None)
+            # Built as an explicit object-dtype Series: .astype(object) leaves
+            # pd.Timestamp in place, and .map() re-infers straight back to
+            # datetime64. Only forcing dtype=object survives both.
+            prepared[column] = pd.Series(
+                [value.to_pydatetime() if pd.notna(value) else None for value in series],
+                index=series.index,
+                dtype=object,
+            )
+    prepared = prepared.astype(object).where(pd.notna(prepared), None)
+    return prepared.to_dict(orient="records")
 
 
 # --------------------------------------------------------------------------
@@ -198,7 +234,7 @@ def read_hourly_departures(
     label_source: str | None = None,
 ) -> pd.DataFrame:
     engine = engine or get_engine()
-    cutoff = datetime.now(tz=timezone.utc).replace(tzinfo=None) - timedelta(days=window_days)
+    cutoff = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(days=window_days)
     query = (
         "SELECT station_short_name, hour_ts, SUM(departures) AS departures "
         "FROM hourly_departures WHERE hour_ts >= :cutoff "
@@ -218,7 +254,7 @@ def read_recent_snapshots(
     hours: int = 6, engine: Engine | None = None
 ) -> pd.DataFrame:
     engine = engine or get_engine()
-    cutoff = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+    cutoff = datetime.now(tz=UTC) - timedelta(hours=hours)
     frame = pd.read_sql(
         text(
             "SELECT * FROM status_snapshots WHERE snapshot_ts >= :cutoff "

@@ -51,7 +51,7 @@ class LightGBMDemandModel:
         y_train: pd.Series,
         x_validation: pd.DataFrame | None = None,
         y_validation: pd.Series | None = None,
-    ) -> "LightGBMDemandModel":
+    ) -> LightGBMDemandModel:
         params = self._params()
         early_stopping = int(
             self._config.get_path("models.lightgbm.early_stopping_rounds", 100)

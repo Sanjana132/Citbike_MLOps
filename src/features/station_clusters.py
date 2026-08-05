@@ -60,7 +60,7 @@ class EntityMapping:
         return target
 
     @classmethod
-    def load(cls, path: str | Path) -> "EntityMapping":
+    def load(cls, path: str | Path) -> EntityMapping:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
         return cls(
             granularity=payload["granularity"],
@@ -102,7 +102,7 @@ def fit_entity_mapping(
             .assign(n_stations=1)
             .reset_index(drop=True)
         )
-        mapping = dict(zip(frame["short_name"], frame["entity_id"]))
+        mapping = dict(zip(frame["short_name"], frame["entity_id"], strict=True))
         logger.info("Entity mapping: per-station, %d entities", len(entities))
         return EntityMapping("station", mapping, entities[ENTITY_COLUMNS])
 
@@ -137,7 +137,7 @@ def fit_entity_mapping(
         )
         .reset_index()
     )
-    mapping = dict(zip(frame["short_name"], frame["entity_id"]))
+    mapping = dict(zip(frame["short_name"], frame["entity_id"], strict=True))
     logger.info(
         "Entity mapping: %d clusters over %d stations (median %d stations/cluster)",
         len(entities), len(frame), int(entities["n_stations"].median()),

@@ -17,7 +17,7 @@ fields, and a single malformed station must never take down an ingestion run.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
@@ -114,9 +114,9 @@ class GBFSClient:
             raise ValueError(f"Feed {url} did not contain data.stations list")
         last_updated_raw = _to_int(payload.get("last_updated"))
         last_updated = (
-            datetime.fromtimestamp(last_updated_raw, tz=timezone.utc)
+            datetime.fromtimestamp(last_updated_raw, tz=UTC)
             if last_updated_raw
-            else datetime.now(tz=timezone.utc)
+            else datetime.now(tz=UTC)
         )
         return stations, last_updated
 
@@ -193,7 +193,7 @@ class GBFSClient:
                     "is_renting": _to_bool_int(station.get("is_renting")),
                     "is_returning": _to_bool_int(station.get("is_returning")),
                     "last_reported": (
-                        datetime.fromtimestamp(last_reported_raw, tz=timezone.utc)
+                        datetime.fromtimestamp(last_reported_raw, tz=UTC)
                         if last_reported_raw
                         else None
                     ),

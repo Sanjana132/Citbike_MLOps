@@ -25,8 +25,8 @@ from __future__ import annotations
 import logging
 import re
 import zipfile
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 import pandas as pd
 

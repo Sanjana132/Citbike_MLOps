@@ -74,7 +74,7 @@ def test_aggregates_trips_into_hourly_counts():
         }
     )
     result = aggregate_chunk(chunk, schema)
-    counts = dict(zip(result["hour_ts"].astype(str), result["departures"]))
+    counts = dict(zip(result["hour_ts"].astype(str), result["departures"], strict=True))
     assert counts["2026-06-01 08:00:00"] == 2
     assert counts["2026-06-01 09:00:00"] == 1
 

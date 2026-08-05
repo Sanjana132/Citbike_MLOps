@@ -21,7 +21,7 @@ import argparse
 import logging
 import random
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import mlflow
@@ -29,8 +29,7 @@ import numpy as np
 import pandas as pd
 
 from src.config import Config, data_dir, load_config
-from src.features.build_features import TARGET_COLUMN, TIME_KEY
-from src.features.station_clusters import EntityMapping, fit_entity_mapping
+from src.features.station_clusters import fit_entity_mapping
 from src.models.dataset import Dataset, build_dataset, regression_metrics, seasonal_naive_baseline
 from src.models.lightgbm_model import LightGBMDemandModel
 from src.models.promote import Candidate, run_promotion
@@ -273,7 +272,7 @@ def run_training(
     summary = dataset.summary()
     logger.info("Dataset: %s", summary)
 
-    run_name = f"{source}-{datetime.now(tz=timezone.utc):%Y%m%dT%H%M%SZ}"
+    run_name = f"{source}-{datetime.now(tz=UTC):%Y%m%dT%H%M%SZ}"
     with mlflow.start_run(run_name=run_name) as parent_run:
         mlflow.set_tags(
             {
@@ -303,7 +302,7 @@ def run_training(
             mlflow.log_artifact(str(mapping_path))
 
             run_metadata = {
-                "trained_at": datetime.now(tz=timezone.utc).isoformat(),
+                "trained_at": datetime.now(tz=UTC).isoformat(),
                 "train_start": summary["train_start"],
                 "train_end": summary["train_end"],
                 "granularity": mapping.granularity,

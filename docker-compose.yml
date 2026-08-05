@@ -1,0 +1,190 @@
+# Full stack: postgres + mlflow + api (+ airflow and dashboard, added in M3/M4).
+#
+#   cp .env.example .env      # then edit the passwords
+#   docker compose up -d postgres mlflow api
+#
+# Services are health-gated so `api` never starts before MLflow can answer.
+
+name: citibike-demand-mlops
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-citibike}:${POSTGRES_PASSWORD:-citibike}@postgres:5432/${POSTGRES_DB:-citibike}
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  CITIBIKE_CONFIG: /app/config/config.yaml
+  CITIBIKE_DATA_DIR: /app/data
+  PYTHONPATH: /app
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: citibike-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-citibike}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-citibike}
+      POSTGRES_DB: ${POSTGRES_DB:-citibike}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      # Runs once on an empty data volume: creates the mlflow/airflow
+      # databases, then applies the application schema.
+      - ./docker/postgres-init/00-create-mlflow-db.sql:/docker-entrypoint-initdb.d/00-create-mlflow-db.sql:ro
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-citibike} -d ${POSTGRES_DB:-citibike}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mlflow
+    container_name: citibike-mlflow
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql+psycopg2://${POSTGRES_USER:-citibike}:${POSTGRES_PASSWORD:-citibike}@postgres:5432/mlflow
+      MLFLOW_ARTIFACT_ROOT: /mlflow/artifacts
+    volumes:
+      - mlflow-artifacts:/mlflow/artifacts
+    ports:
+      - "${MLFLOW_PORT:-5001}:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: citibike-api
+    environment:
+      <<: *app-env
+    volumes:
+      # Shared so the API can read the parquet cache and bootstrap can write it.
+      - ./data:/app/data
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: citibike-dashboard
+    environment:
+      <<: *app-env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    command: >
+      streamlit run src/dashboard/app.py
+      --server.port=8501 --server.address=0.0.0.0
+      --server.headless=true --browser.gatherUsageStats=false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Airflow. Uses LocalExecutor: this is a single-host demo stack, and
+  # CeleryExecutor would add Redis plus worker containers for no benefit.
+  # ---------------------------------------------------------------------
+  airflow-init:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: citibike-airflow-init
+    environment:
+      <<: &airflow-env
+        AIRFLOW__CORE__EXECUTOR: LocalExecutor
+        AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-citibike}:${POSTGRES_PASSWORD:-citibike}@postgres:5432/airflow
+        AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+        AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+        AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-}
+        AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-insecure-dev-key}
+        AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+        DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-citibike}:${POSTGRES_PASSWORD:-citibike}@postgres:5432/${POSTGRES_DB:-citibike}
+        MLFLOW_TRACKING_URI: http://mlflow:5000
+        CITIBIKE_CONFIG: /opt/airflow/config/config.yaml
+        CITIBIKE_DATA_DIR: /opt/airflow/data
+        PYTHONPATH: /opt/airflow
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-airflow}
+    volumes: &airflow-volumes
+      - ./dags:/opt/airflow/dags:ro
+      - ./src:/opt/airflow/src:ro
+      - ./config:/opt/airflow/config:ro
+      - ./sql:/opt/airflow/sql:ro
+      - ./scripts:/opt/airflow/scripts:ro
+      - ./data:/opt/airflow/data
+      - airflow-logs:/opt/airflow/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: /bin/bash
+    command: -c "airflow db migrate && airflow users create --username $${_AIRFLOW_WWW_USER_USERNAME} --password $${_AIRFLOW_WWW_USER_PASSWORD} --firstname admin --lastname user --role Admin --email admin@example.com || true"
+
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: citibike-airflow-webserver
+    environment:
+      <<: *airflow-env
+    volumes: *airflow-volumes
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 12
+      start_period: 60s
+    restart: unless-stopped
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.airflow
+    container_name: citibike-airflow-scheduler
+    environment:
+      <<: *airflow-env
+    volumes: *airflow-volumes
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mlflow-artifacts:
+  airflow-logs:

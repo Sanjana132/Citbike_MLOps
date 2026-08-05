@@ -82,7 +82,7 @@ def snapshots() -> pd.DataFrame:
         ("uuid-a", [20, 19, 18, 18, 16, 15, 15, 14, 13, 13, 12, 11, 10]),
         ("uuid-b", [10, 10, 11, 12, 12, 11, 11, 10, 10, 9, 9, 8, 8]),
     ):
-        for timestamp, bikes in zip(times, inventory):
+        for timestamp, bikes in zip(times, inventory, strict=True):
             rows.append(
                 {
                     "station_id": station_id,

@@ -108,6 +108,19 @@ promotion:
   # If there is no champion yet, the best candidate is promoted unconditionally.
   metric: mae
 
+serving:
+  # This is a next-hour forecaster. Requests further out than this are rejected
+  # rather than answered with all-NaN lag features, which would look like a
+  # valid prediction while being close to meaningless.
+  max_forecast_horizon_hours: 24
+  # Re-resolve the production alias this often so a promotion goes live without
+  # a redeploy.
+  model_refresh_seconds: 300
+  # If no history exists in the recent window, look back this far and serve the
+  # newest slice available, flagged as stale. Covers the case where only the
+  # historical backfill is loaded and live ingestion has not started.
+  stale_history_lookback_days: 730
+
 monitoring:
   # monitor_dag triggers retrain_dag when either threshold is breached.
   rolling_mae_window_hours: 24

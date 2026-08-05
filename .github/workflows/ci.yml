@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch keeps the CI image small; the LSTM does not need CUDA.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Lint
+        run: ruff check src tests dags scripts
+
+      - name: Format check
+        run: ruff format --check src tests dags scripts
+        continue-on-error: true
+
+      - name: Run tests
+        # Tests are hermetic: no network, no database, no MLflow server.
+        run: pytest -q --maxfail=1
+        env:
+          CITIBIKE_CONFIG: config/config.yaml
+
+  validate-dags:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Airflow and project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "apache-airflow==2.10.5" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt"
+          pip install PyYAML pandas
+
+      - name: Check DAGs import cleanly
+        # Catches syntax errors and bad imports before they reach the scheduler,
+        # where a broken DAG silently stops running.
+        run: |
+          export PYTHONPATH=$PWD
+          export AIRFLOW_HOME=$PWD/.airflow
+          airflow db migrate
+          python -c "
+          from airflow.models import DagBag
+          bag = DagBag('dags', include_examples=False)
+          if bag.import_errors:
+              for path, error in bag.import_errors.items():
+                  print(f'FAILED {path}:\n{error}')
+              raise SystemExit(1)
+          print(f'OK: {len(bag.dags)} DAGs imported: {sorted(bag.dags)}')
+          "
+
+  build-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose file
+        run: docker compose config --quiet
+      - name: Build application image
+        run: docker compose build api
