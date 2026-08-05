@@ -158,15 +158,30 @@ def complete_panel(
     observations: pd.DataFrame,
     *,
     extra_hours: pd.DatetimeIndex | None = None,
+    config: Config | None = None,
 ) -> pd.DataFrame:
     """Expand observations to a dense (entity x hour) grid.
 
-    A missing (entity, hour) pair means *no departures were recorded*, which is a
-    genuine zero, not missing data - so gaps are filled with 0. ``extra_hours``
-    appends rows whose target is unknown (NaN); the serving path uses this to
-    request features for a future hour while still deriving its lags from
-    observed history.
+    A missing (entity, hour) pair usually means *no departures were recorded*,
+    which is a genuine zero rather than missing data - so short gaps are filled
+    with 0.
+
+    **Long gaps are not.** Blending the historical backfill with live proxy data
+    leaves a hole between where the trip CSVs end and where live ingestion began
+    (a 33-day hole on this stack). Filling that with zeros fabricates a month of
+    "no demand": it trains the model on invented data, and if the hole lands in
+    the validation window it makes the split entirely zeros, which showed up as
+    a val_mae of 0.001 and a *better-looking* test MAE that would have been
+    promoted over a genuinely better model. Runs of missing hours longer than
+    ``features.max_gap_fill_hours`` are therefore left NaN and dropped from
+    training instead.
+
+    ``extra_hours`` appends rows whose target is unknown (NaN); the serving path
+    uses this to request features for a future hour while still deriving its
+    lags from observed history.
     """
+    cfg = config or load_config()
+    max_gap = int(cfg.get_path("features.max_gap_fill_hours", 24))
     if observations.empty:
         raise ValueError("Cannot build a feature panel from zero observations")
 
@@ -185,14 +200,34 @@ def complete_panel(
 
     dense = grid.merge(frame, on=[ENTITY_KEY, TIME_KEY], how="left")
 
-    # Observed hours with no rows are true zeros. Hours beyond the observed
-    # window (the serving horizon) must stay NaN - they are not yet known.
+    dense = dense.sort_values([ENTITY_KEY, TIME_KEY]).reset_index(drop=True)
+
+    # Hours beyond the observed window (the serving horizon) must stay NaN -
+    # they are not yet known.
     observed_end = frame[TIME_KEY].max()
     within_observed = dense[TIME_KEY] <= observed_end
-    dense.loc[within_observed, TARGET_COLUMN] = dense.loc[
-        within_observed, TARGET_COLUMN
-    ].fillna(0.0)
-    return dense.sort_values([ENTITY_KEY, TIME_KEY]).reset_index(drop=True)
+    missing = dense[TARGET_COLUMN].isna() & within_observed
+
+    # Measure each run of consecutive missing hours per entity, and fill only
+    # the short ones. A run boundary is either a change in the missing flag or a
+    # change of entity.
+    run_change = (missing != missing.shift(1)) | (
+        dense[ENTITY_KEY] != dense[ENTITY_KEY].shift(1)
+    )
+    run_id = run_change.cumsum()
+    run_length = run_id.map(run_id.value_counts())
+
+    fillable = missing & (run_length <= max_gap)
+    dense.loc[fillable, TARGET_COLUMN] = 0.0
+
+    unfilled = int((missing & ~fillable).sum())
+    if unfilled:
+        logger.warning(
+            "Left %d hours unfilled: they fall in gaps longer than %dh and are "
+            "absent data, not observed zeros",
+            unfilled, max_gap,
+        )
+    return dense
 
 
 def build_feature_panel(
@@ -228,7 +263,7 @@ def build_feature_panel(
     """
     cfg = config or load_config()
 
-    panel = complete_panel(observations, extra_hours=extra_hours)
+    panel = complete_panel(observations, extra_hours=extra_hours, config=cfg)
     panel = add_lag_features(panel, cfg)
     panel = add_calendar_features(panel, cfg)
 

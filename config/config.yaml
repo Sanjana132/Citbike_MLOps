@@ -56,6 +56,12 @@ features:
   # Stations below this many total departures over the training window are
   # dropped as dead/decommissioned docks.
   min_departures_per_station: 50
+  # A missing (entity, hour) is normally a genuine zero-demand hour and is
+  # filled as such. Runs of missing hours LONGER than this are treated as absent
+  # data and left out of training. This matters for the "blend" source: there is
+  # a multi-week hole between where the trip CSVs end and where live ingestion
+  # began, and filling it with zeros fabricates weeks of no demand.
+  max_gap_fill_hours: 24
   lag_hours: [1, 2, 3, 24, 168]
   rolling_windows_hours: [24, 168]
   holiday_country: US

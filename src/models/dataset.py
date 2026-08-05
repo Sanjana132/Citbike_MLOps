@@ -81,11 +81,37 @@ def chronological_split(
     test = panel[panel[TIME_KEY] >= test_start]
 
     if train.empty or validation.empty or test.empty:
-        raise ValueError(
-            "Chronological split produced an empty partition; the training "
-            f"window ({panel[TIME_KEY].min()}..{max_ts}) is too short for "
-            f"test_size_hours={test_hours} + validation_size_hours={val_hours}"
+        empty = [
+            name
+            for name, part in (("train", train), ("validation", validation), ("test", test))
+            if part.empty
+        ]
+        # Distinguish "not enough history" from "history has a hole in it".
+        # The blend source hits the second case: trip CSVs end weeks before live
+        # ingestion begins, and a split window can land entirely inside the gap.
+        # Reporting "too short" there would send an operator chasing the wrong
+        # problem entirely.
+        observed_hours = panel[TIME_KEY].drop_duplicates().sort_values()
+        deltas = observed_hours.diff()
+        largest_gap = deltas.max()
+        detail = (
+            f"Chronological split produced empty partition(s): {empty}. "
+            f"Data spans {panel[TIME_KEY].min()} to {max_ts} "
+            f"({len(observed_hours)} distinct hours) with "
+            f"test_size_hours={test_hours} and validation_size_hours={val_hours}."
         )
+        if pd.notna(largest_gap) and largest_gap > pd.Timedelta(hours=24):
+            gap_end = observed_hours[deltas == largest_gap].iloc[0]
+            detail += (
+                f" The data contains a {largest_gap} gap ending {gap_end}, so a "
+                "split window falls inside it. This is the expected state when "
+                "blending historical trip CSVs with live proxy data before the "
+                "ingestion DAG has accumulated enough history to bridge the gap "
+                "- train with --source offline until it has."
+            )
+        else:
+            detail += " The available history is too short for these split sizes."
+        raise ValueError(detail)
     logger.info(
         "Split -> train %d rows (<%s), val %d rows, test %d rows (>=%s)",
         len(train), val_start, len(validation), len(test), test_start,

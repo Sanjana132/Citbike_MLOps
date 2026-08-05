@@ -153,3 +153,70 @@ def test_build_survives_missing_weather(observations, mapping, config):
 def test_complete_panel_rejects_empty_input():
     with pytest.raises(ValueError, match="zero observations"):
         complete_panel(pd.DataFrame(columns=["entity_id", TIME_KEY, TARGET_COLUMN]))
+
+
+# --------------------------------------------------------------------------
+# Gap handling: absent data must not become fabricated zeros
+# --------------------------------------------------------------------------
+
+def test_long_gaps_are_not_filled_with_zeros(mapping, weather, config):
+    """A multi-week hole is absent data, not weeks of zero demand.
+
+    Blending the historical backfill with live proxy data leaves exactly such a
+    hole. Filling it with zeros trains the model on invented data and, when the
+    hole lands in the validation window, produces a meaningless near-zero
+    val_mae alongside a flattering test MAE.
+    """
+    entity = mapping.entities["entity_id"].iloc[0]
+    early = pd.date_range("2026-04-01", periods=200, freq="h")
+    late = pd.date_range("2026-06-01", periods=200, freq="h")  # ~5 weeks later
+    observations = pd.DataFrame(
+        {
+            "entity_id": entity,
+            TIME_KEY: early.append(late),
+            TARGET_COLUMN: 5.0,
+        }
+    )
+
+    panel = build_feature_panel(observations, mapping.entities, weather, config)
+    gap = panel[
+        (panel[TIME_KEY] > early.max()) & (panel[TIME_KEY] < late.min())
+    ]
+    assert not gap.empty, "fixture should span a gap"
+    assert gap[TARGET_COLUMN].isna().all(), "long gap must stay NaN, not become 0"
+
+    # Observed hours are untouched.
+    observed = panel[panel[TIME_KEY].isin(early)]
+    assert (observed[TARGET_COLUMN] == 5.0).all()
+
+
+def test_short_gaps_are_still_filled_with_zeros(mapping, weather, config):
+    """A quiet overnight hour with no rides really is zero demand."""
+    entity = mapping.entities["entity_id"].iloc[0]
+    hours = pd.date_range("2026-04-01", periods=300, freq="h")
+    kept = hours.delete(150)  # a single missing hour
+    observations = pd.DataFrame(
+        {"entity_id": entity, TIME_KEY: kept, TARGET_COLUMN: 5.0}
+    )
+
+    panel = build_feature_panel(observations, mapping.entities, weather, config)
+    filled = panel[panel[TIME_KEY] == hours[150]]
+    assert len(filled) == 1
+    assert filled[TARGET_COLUMN].iloc[0] == 0.0
+
+
+def test_gap_rows_are_dropped_from_training(mapping, weather, config):
+    """Unfilled gap rows must not reach the model as NaN targets."""
+    from src.features.station_clusters import aggregate_to_entities  # noqa: F401
+
+    entity = mapping.entities["entity_id"].iloc[0]
+    early = pd.date_range("2026-04-01", periods=800, freq="h")
+    late = pd.date_range("2026-06-15", periods=800, freq="h")
+    observations = pd.DataFrame(
+        {"entity_id": entity, TIME_KEY: early.append(late), TARGET_COLUMN: 5.0}
+    )
+    panel = build_feature_panel(observations, mapping.entities, weather, config)
+    assert panel[TARGET_COLUMN].isna().any(), "fixture should produce gap rows"
+
+    trainable = panel[panel[TARGET_COLUMN].notna()]
+    assert not trainable[TARGET_COLUMN].isna().any()
