@@ -491,12 +491,22 @@ def train_deep_model(
             )
 
         logger.info(
-            "Deep model: test MAE=%.4f RMSE=%.4f (coverage %.1f%%)",
+            "Deep model (in-process): test MAE=%.4f RMSE=%.4f (coverage %.1f%%)",
             metrics["test_mae"], metrics["test_rmse"], 100 * metrics["test_coverage"],
         )
+
+        # Promotion uses the as-served score, not the one above. The two differ
+        # sharply for this model: predict_split feeds it true 168-hour
+        # sequences, while the pyfunc serving path reconstructs them from five
+        # lag columns. Comparing candidates on the in-process number promoted an
+        # LSTM that served 60% worse than the LightGBM it displaced.
+        from src.models.train import _log_served_metrics
+
+        model_uri = f"runs:/{run.info.run_id}/model"
+        served = _log_served_metrics(model_uri, dataset, metrics, "Deep model")
         return Candidate(
             name="deep",
             run_id=run.info.run_id,
-            metrics={k.removeprefix("test_"): v for k, v in metrics.items() if k.startswith("test_")},
-            model_uri=f"runs:/{run.info.run_id}/model",
+            metrics=served,
+            model_uri=model_uri,
         )

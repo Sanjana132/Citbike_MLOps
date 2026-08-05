@@ -54,6 +54,7 @@ def emit_baseline(config, hours: int = 30) -> dict:
     from src.features.build_features import TIME_KEY, feature_columns
     from src.features.station_clusters import aggregate_to_entities
     from src.ingestion.weather import weather_window_for
+    from src.models.pyfunc_wrapper import to_model_input
     from src.serving.history import load_recent_history
     from src.storage.db import write_features, write_hourly_departures, write_predictions
 
@@ -74,7 +75,7 @@ def emit_baseline(config, hours: int = 30) -> dict:
         raise RuntimeError("Not enough history to build a baseline window")
 
     features = feature_columns(config)
-    predictions = bundle.model.predict(recent[features])
+    predictions = bundle.model.predict(to_model_input(recent, features))
 
     # The monitor's rolling window is measured backwards from *now*, but the
     # historical backfill ends weeks earlier. Timestamps are shifted forward so
@@ -141,6 +142,7 @@ def inject_drift(config, shift: float = 2.5, hours: int = 24) -> dict:
     was trained on.
     """
     from src.features.build_features import feature_columns
+    from src.models.pyfunc_wrapper import to_model_input
     from src.storage.db import (
         read_features,
         write_features,
@@ -174,7 +176,7 @@ def inject_drift(config, shift: float = 2.5, hours: int = 24) -> dict:
     write_features(frame[["entity_id", "hour_ts"] + features])
 
     # The model still predicts from the drifted features...
-    predictions = bundle.model.predict(frame[features].astype(float))
+    predictions = bundle.model.predict(to_model_input(frame, features))
     write_predictions(
         pd.DataFrame(
             {

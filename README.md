@@ -224,6 +224,26 @@ random split on a time series lets the model see `t+1` while predicting `t`.
 alone; promoting on any improvement would churn production daily for no real
 gain and make every incident harder to explain.
 
+**Promotion scores candidates through the serving path, not an in-process
+estimator.** This is the single most important correction in the project, and it
+was earned. The LSTM was promoted on an in-process holdout MAE of **22.25**,
+computed by feeding it true 168-hour sequences. Its pyfunc serving path rebuilds
+those sequences from five lag columns and actually scores **39.27** — 76% worse
+than the number it was promoted on, and **60% worse than the LightGBM champion
+(24.57) it displaced**. Champion/challenger shipped a materially worse model
+while its scoreboard said otherwise.
+
+The feature-parity test could not catch this: features were identical on both
+sides. The skew was in how the *model* was applied. So `train.py` now loads each
+candidate back through `mlflow.pyfunc` and scores the same holdout through it,
+and those as-served numbers are what promotion compares. The in-process metrics
+are still logged for diagnosis, alongside an explicit `serving_gap_ratio` so a
+candidate that cannot reproduce its own holdout is visible rather than silently
+promoted.
+
+The general rule, worth stating plainly: **measure the artifact you ship, not
+the object in memory.**
+
 **Monitoring thresholds are calibrated to this target, and that mattered.** The
 first run of the loop fired on *clean* baseline data, for two reasons worth
 recording:

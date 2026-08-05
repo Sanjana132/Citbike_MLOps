@@ -33,7 +33,7 @@ from src.features.station_clusters import fit_entity_mapping
 from src.models.dataset import Dataset, build_dataset, regression_metrics, seasonal_naive_baseline
 from src.models.lightgbm_model import LightGBMDemandModel
 from src.models.promote import Candidate, run_promotion
-from src.models.pyfunc_wrapper import DemandModelWrapper, build_artifacts
+from src.models.pyfunc_wrapper import DemandModelWrapper, build_artifacts, to_model_input
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,12 @@ def load_blended_departures(
 # --------------------------------------------------------------------------
 
 def _evaluate(model, dataset: Dataset) -> dict[str, float]:
-    """Score a fitted model on validation and test, plus the naive baseline."""
+    """Score a fitted model on validation and test, plus the naive baseline.
+
+    These are *in-process* metrics, measured on the in-memory estimator. They are
+    diagnostic only - :func:`score_as_served` produces the numbers that decide
+    promotion.
+    """
     metrics: dict[str, float] = {}
     for split in ("validation", "test"):
         x, y = dataset.xy(split)
@@ -136,6 +141,30 @@ def _evaluate(model, dataset: Dataset) -> dict[str, float]:
             metrics[f"{split.replace('validation', 'val')}_{key}"] = value
     metrics.update(seasonal_naive_baseline(dataset.test))
     return metrics
+
+
+def score_as_served(model_uri: str, dataset: Dataset) -> dict[str, float]:
+    """Score a logged model through the EXACT path that will serve it.
+
+    This exists because measuring one code path and shipping another is how a
+    worse model reaches production while its scoreboard says otherwise. It
+    happened here: the LSTM was promoted on an in-process holdout MAE of 22.25,
+    computed from true 168-hour sequences, but the pyfunc serving path rebuilds
+    those sequences from five lag columns and actually scores **39.27** - 60%
+    worse than the LightGBM champion it displaced.
+
+    Loading the model back through ``mlflow.pyfunc`` and scoring the same
+    holdout closes that gap by construction: whatever number promotion compares
+    is a number the serving path can actually deliver.
+    """
+    import mlflow.pyfunc
+
+    from src.models.pyfunc_wrapper import to_model_input
+
+    served = mlflow.pyfunc.load_model(model_uri)
+    x_test, y_test = dataset.xy("test")
+    predictions = served.predict(to_model_input(x_test, dataset.features))
+    return regression_metrics(y_test, predictions)
 
 
 def train_lightgbm_candidate(
@@ -189,20 +218,49 @@ def train_lightgbm_candidate(
                 # float - which is exactly what happens to features read back
                 # out of the JSONB features table. MLflow warns about this
                 # itself at log time.
-                input_example=x_val.head(5).astype("float64"),
+                input_example=to_model_input(x_val.head(5), dataset.features),
                 code_paths=["src"],
             )
 
-        logger.info(
-            "LightGBM: test MAE=%.4f RMSE=%.4f (baseline MAE=%.4f)",
-            metrics["test_mae"], metrics["test_rmse"], metrics.get("baseline_mae", float("nan")),
-        )
+        model_uri = f"runs:/{run.info.run_id}/model"
+        served = _log_served_metrics(model_uri, dataset, metrics, "LightGBM")
         return Candidate(
             name="lightgbm",
             run_id=run.info.run_id,
-            metrics={k.removeprefix("test_"): v for k, v in metrics.items() if k.startswith("test_")},
-            model_uri=f"runs:/{run.info.run_id}/model",
+            metrics=served,
+            model_uri=model_uri,
         )
+
+
+def _log_served_metrics(
+    model_uri: str, dataset: Dataset, in_process: dict[str, float], label: str
+) -> dict[str, float]:
+    """Score through the serving path, log the comparison, and return it.
+
+    The gap between in-process and as-served metrics is logged explicitly, so a
+    candidate whose serving path cannot reproduce its own holdout is visible in
+    MLflow rather than silently promoted.
+    """
+    served = score_as_served(model_uri, dataset)
+    mlflow.log_metrics({f"served_{k}": v for k, v in served.items()})
+
+    in_process_mae = in_process.get("test_mae")
+    if in_process_mae:
+        gap = (served["mae"] - in_process_mae) / in_process_mae
+        mlflow.log_metric("serving_gap_ratio", gap)
+        if abs(gap) > 0.05:
+            logger.warning(
+                "%s: as-served MAE %.4f differs from in-process %.4f by %.1f%% - "
+                "the serving path does not reproduce the holdout",
+                label, served["mae"], in_process_mae, 100 * gap,
+            )
+    logger.info(
+        "%s: as-served test MAE=%.4f RMSE=%.4f (in-process %.4f, baseline %.4f)",
+        label, served["mae"], served["rmse"],
+        in_process_mae if in_process_mae else float("nan"),
+        in_process.get("baseline_mae", float("nan")),
+    )
+    return served
 
 
 def train_deep_candidate(

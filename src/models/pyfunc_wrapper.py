@@ -73,6 +73,26 @@ class DemandModelWrapper(mlflow.pyfunc.PythonModel):
         return np.clip(np.asarray(raw, dtype=float), 0.0, None)
 
 
+def to_model_input(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    """The single definition of what a model is fed at inference time.
+
+    Every consumer goes through here - the API, the drift simulator, and the
+    as-served scoring in ``train.py`` - for the same reason there is only one
+    feature builder: two code paths constructing model input differently is how
+    train/serve skew gets in.
+
+    Concretely, this pins the dtype contract. Model signatures are inferred from
+    a float64 example so that features read back out of the JSONB ``features``
+    table (all float after a JSON round-trip) are accepted; MLflow's schema
+    enforcement then rejects int64 input as an unsafe conversion. Casting here
+    keeps both directions working.
+    """
+    missing = [c for c in features if c not in frame.columns]
+    if missing:
+        raise ValueError(f"Cannot build model input; missing columns: {missing[:10]}")
+    return frame[features].astype("float64")
+
+
 def build_artifacts(
     directory: Path,
     *,

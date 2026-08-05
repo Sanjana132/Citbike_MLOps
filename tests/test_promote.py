@@ -108,3 +108,76 @@ def test_missing_metric_is_an_error_not_a_silent_pass():
     broken = Candidate("broken", "run-x", {"rmse": 1.0}, "uri")
     with pytest.raises(KeyError, match="mae"):
         decide_promotion([broken], champion_score=10.0)
+
+
+# --------------------------------------------------------------------------
+# Promotion must compare what actually gets served
+# --------------------------------------------------------------------------
+
+def test_promotion_uses_as_served_metrics_not_in_process_ones():
+    """Regression test for the worst defect this project produced.
+
+    The LSTM was promoted on an in-process holdout MAE of 22.25, computed from
+    true 168-hour sequences. Its pyfunc serving path rebuilds those sequences
+    from five lag columns and actually scores 39.27 - 60% worse than the
+    LightGBM champion (24.57) it displaced. Promotion shipped a worse model
+    while its scoreboard said otherwise.
+
+    Candidate.metrics must therefore hold the as-served numbers, so that a model
+    whose serving path cannot reproduce its holdout loses.
+    """
+    lightgbm = Candidate("lightgbm", "run-lgb", {"mae": 24.566}, "uri-lgb")
+    # As-served metrics for the deep model, not its flattering in-process ones.
+    deep_as_served = Candidate("deep", "run-deep", {"mae": 39.267}, "uri-deep")
+
+    decision = decide_promotion(
+        [lightgbm, deep_as_served], champion_score=24.566, min_relative_improvement=0.02
+    )
+    assert not decision.promote
+    assert decision.challenger.name == "lightgbm"
+
+    # And the counterfactual: scored on in-process numbers it would have won.
+    deep_in_process = Candidate("deep", "run-deep", {"mae": 22.245}, "uri-deep")
+    bad = decide_promotion(
+        [lightgbm, deep_in_process], champion_score=24.566, min_relative_improvement=0.02
+    )
+    assert bad.promote and bad.challenger.name == "deep"
+
+
+def test_score_as_served_round_trips_through_the_serving_path(monkeypatch):
+    """score_as_served must load the logged model, not reuse the in-memory one."""
+    import numpy as np
+    import pandas as pd
+
+    from src.models import train as train_module
+
+    loaded = {}
+
+    class FakeServed:
+        def predict(self, frame):
+            loaded["rows"] = len(frame)
+            loaded["dtype"] = str(frame["a"].dtype)
+            return np.full(len(frame), 10.0)
+
+    import mlflow.pyfunc
+
+    monkeypatch.setattr(
+        mlflow.pyfunc,
+        "load_model",
+        lambda uri: (loaded.setdefault("uri", uri), FakeServed())[1],
+    )
+
+    class FakeDataset:
+        features = ["a"]
+
+        def xy(self, split):
+            assert split == "test", "promotion must score the holdout, not train"
+            frame = pd.DataFrame({"a": [1, 2, 3]})  # int, as a real panel would be
+            return frame, pd.Series([10.0, 10.0, 10.0])
+
+    metrics = train_module.score_as_served("runs:/abc/model", FakeDataset())
+    assert loaded["uri"] == "runs:/abc/model"
+    assert loaded["rows"] == 3
+    # Input must reach the model as float64, matching the logged signature.
+    assert loaded["dtype"] == "float64"
+    assert metrics["mae"] == 0.0

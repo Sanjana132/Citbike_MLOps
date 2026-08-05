@@ -350,7 +350,9 @@ def predict(request: PredictRequest) -> PredictResponse:
         if rows.empty:
             raise HTTPException(status_code=404, detail="No requested entity is known to this model")
 
-    features = rows[feature_columns(config)]
+    from src.models.pyfunc_wrapper import to_model_input
+
+    features = to_model_input(rows, feature_columns(config))
     try:
         predicted = bundle.model.predict(features)
     except Exception as exc:  # noqa: BLE001
