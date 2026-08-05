@@ -119,13 +119,36 @@ Trained on **Apr–Jun 2026**: 13.85M trips, 2,270 stations, aggregated to
 40 geographic clusters (median 58 stations, ~0.9 km mean radius). Test set is
 the final 14 days, held out chronologically.
 
-| Model | Test MAE | RMSE | sMAPE |
-|---|---|---|---|
-| **LightGBM** (Poisson) | **24.57** | 51.82 | 22.80% |
-| Seasonal naive (same hour, last week) | 46.13 | — | — |
+Every figure below is **as-served**: the model was loaded back through
+`mlflow.pyfunc` and scored through the path that actually serves it.
+
+| Model | Test MAE | RMSE | sMAPE | In-process MAE | Serving gap |
+|---|---|---|---|---|---|
+| **LightGBM** (Poisson) — **champion** | **24.57** | 51.82 | 22.80% | 24.57 | **0.0%** |
+| LSTM (deep candidate) | 39.27 | 92.53 | 40.66% | 22.25 | **+76.5%** |
+| Seasonal naive (same hour, last week) | 46.13 | — | — | — | — |
 
 LightGBM is **47% better than the seasonal-naive baseline**. Mean demand is
-~161 departures per cluster-hour, so MAE 24.6 is roughly 15% of the mean.
+~161 departures per cluster-hour, so MAE 24.6 is roughly 15% of the mean. Its
+serving path reproduces its holdout exactly — a 0.0% gap.
+
+**The LSTM is registered but not promoted, and that is the correct outcome.**
+Its in-process score of 22.25 would have beaten LightGBM by 9.45%, and on an
+earlier run it *did*, and shipped. Scored through its real serving path it
+manages only 39.27 — worse than the naive baseline. The run now says so out
+loud:
+
+```
+WARNING  Deep model: as-served MAE 39.2668 differs from in-process 22.2451
+         by 76.5% - the serving path does not reproduce the holdout
+INFO     Promotion decision: Best challenger lightgbm changed mae by 0.00%,
+         which does not clear the 2.00% bar; keeping the current champion
+```
+
+The gap is not a modelling failure but a plumbing one: `predict_split` feeds the
+LSTM true 168-hour demand sequences, while the pyfunc path reconstructs them
+from five lag columns. Fixing that serving path is the top roadmap item; until
+it is fixed, the honest comparison is the one above and LightGBM wins.
 
 The baseline is reported alongside every run on purpose: a forecasting MAE
 without one is uninterpretable.
@@ -338,11 +361,12 @@ Engineering notes worth knowing:
    origin backtest yet.
 6. **Cluster granularity hides per-station error.** 40 clusters averaging 58
    stations each is coarse for operational rebalancing decisions.
-7. **The deep model is not fully servable.** The LSTM is trained, registered and
-   compared on an identical holdout, but the pyfunc serving path reconstructs
-   its input sequence from lag columns rather than from true history. If it were
-   promoted, serving would be approximate — so LightGBM is the practical
-   champion today.
+7. **The deep model is not servable as built, and is measurably worse.** The
+   LSTM is trained, registered and compared honestly, but its pyfunc serving
+   path reconstructs the input sequence from five lag columns instead of true
+   history, costing it 76.5% (22.25 in-process -> 39.27 as served, worse than
+   the naive baseline). It is correctly never promoted. Rebuilding that serving
+   path is the top roadmap item.
 8. **NOAA precipitation is a probability, not an amount**, in the live path.
 9. **The API image is large** (~10 GB) because torch is installed so that a
    promoted deep model can be loaded.
@@ -375,10 +399,18 @@ kind that stay silent:
 The suite is hermetic — verified by running it with `socket.connect` blocked,
 not merely asserted.
 
-**Roadmap.** Kubernetes deployment; Kafka for snapshot streaming; a dedicated
-feature store (Feast); rolling-origin backtesting; per-station modelling with a
-hierarchical reconciliation step; a true sequence-serving path for the LSTM;
-conformal prediction intervals.
+**Roadmap**, most valuable first:
+
+1. **A true sequence-serving path for the LSTM** — it is the only thing standing
+   between a candidate that scores 22.25 in-process and one that can actually be
+   promoted. Likely means passing recent demand history to the pyfunc wrapper
+   rather than reconstructing it from lag columns.
+2. **Rolling-origin backtesting**, so a single 14-day window stops being the
+   whole evidence base.
+3. **More history**, for seasonal coverage the model has never seen.
+4. Per-station modelling with hierarchical reconciliation; conformal prediction
+   intervals; Kubernetes deployment; Kafka for snapshot streaming; a dedicated
+   feature store (Feast).
 
 ---
 
