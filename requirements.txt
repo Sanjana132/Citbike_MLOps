@@ -1,0 +1,42 @@
+# Pinned to the versions actually resolved and tested at build time (2026-08).
+# Regenerate with: python -m pip list --format=freeze
+# Airflow's own dependencies are governed by its constraint file, so DAG-side
+# pins live in docker/requirements-airflow.txt instead.
+
+# --- core data / ML ---
+pandas==2.3.3
+numpy==2.2.6
+pyarrow==19.0.1
+scikit-learn==1.9.0
+lightgbm==4.7.0
+holidays==0.102
+
+# --- deep model (LSTM candidate) ---
+torch==2.13.0
+
+# --- tracking / registry ---
+mlflow==2.22.5
+
+# --- serving ---
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+pydantic==2.13.4
+
+# --- dashboard ---
+streamlit==1.61.0
+pydeck==0.9.3
+plotly==5.24.1
+
+# --- monitoring ---
+evidently==0.7.21
+
+# --- storage / config / http ---
+SQLAlchemy==2.0.51
+psycopg2-binary==2.9.12
+PyYAML==6.0.3
+requests==2.34.2
+python-dotenv==1.2.2
+
+# --- tests / lint ---
+pytest==9.1.1
+ruff==0.16.1

@@ -1,0 +1,135 @@
+# Citi Bike Demand Forecasting - central configuration.
+# Nothing operational should be hardcoded in src/; read it from here.
+
+project:
+  name: citibike-demand-mlops
+  seed: 42
+  timezone: America/New_York
+
+gbfs:
+  # Verified live 2026-08-04. The "bkn" region feed actually covers the whole
+  # NYC system (2463 stations spanning region_ids 71/70/311), not just Brooklyn.
+  region: bkn
+  discovery_url: https://gbfs.lyft.com/gbfs/1.1/{region}/gbfs.json
+  station_status_url: https://gbfs.lyft.com/gbfs/1.1/{region}/en/station_status.json
+  station_information_url: https://gbfs.lyft.com/gbfs/1.1/{region}/en/station_information.json
+  request_timeout_s: 30
+  max_retries: 3
+
+trip_history:
+  # Monthly zipped trip CSVs. Verified naming at build time; note that the
+  # bucket mixes "-tripdata.csv.zip" and "-tripdata.zip" suffixes, and NYC
+  # months are split across several part files inside one zip.
+  bucket_index_url: https://s3.amazonaws.com/tripdata/
+  # Months to train the initial model on (most recent complete months).
+  months:
+    - "202604"
+    - "202605"
+    - "202606"
+  # NYC system files are ~1GB uncompressed per month, so the loader streams
+  # them in chunks and never materialises the raw CSV in memory.
+  chunk_size: 500000
+  # Keep only stations that also exist in the live GBFS feed, so that the
+  # offline-trained model can actually be served against live data.
+  restrict_to_live_stations: true
+
+weather:
+  # NOAA (api.weather.gov) only retains ~7 days of observations, so it cannot
+  # supply features for a multi-month training window. Open-Meteo's archive API
+  # is used for historical backfill; NOAA is used for the live/forecast path.
+  latitude: 40.7306
+  longitude: -73.9866
+  historical_provider: open_meteo
+  live_provider: noaa
+  open_meteo_archive_url: https://archive-api.open-meteo.com/v1/archive
+  open_meteo_forecast_url: https://api.open-meteo.com/v1/forecast
+  noaa_points_url: https://api.weather.gov/points/{lat},{lon}
+  # api.weather.gov requires a descriptive User-Agent with contact info.
+  noaa_user_agent: "citibike-demand-mlops (sanj18reddy@gmail.com)"
+  request_timeout_s: 30
+
+features:
+  # Prediction granularity. "cluster" reduces sparsity and stabilises the
+  # signal; "station" gives finer resolution but a much noisier target.
+  granularity: cluster        # one of: cluster | station
+  n_clusters: 40              # KMeans on lat/lon, only used when granularity=cluster
+  # Stations below this many total departures over the training window are
+  # dropped as dead/decommissioned docks.
+  min_departures_per_station: 50
+  lag_hours: [1, 2, 3, 24, 168]
+  rolling_windows_hours: [24, 168]
+  holiday_country: US
+
+training:
+  # Chronological split - never random, this is a time series.
+  test_size_hours: 336        # last 14 days held out
+  validation_size_hours: 168  # 7 days before that, used for early stopping
+  target: departures
+  primary_metric: mae         # metric used for champion/challenger promotion
+  rolling_window_days: 90     # retraining window in the retrain DAG
+
+models:
+  # Which candidates to train each retraining run. Both get registered in
+  # MLflow and compared head-to-head by promote.py.
+  candidates: [lightgbm, deep]
+  deep_model: lstm            # one of: lstm | tft
+  lightgbm:
+    objective: poisson        # counts are non-negative and over-dispersed
+    n_estimators: 2000
+    learning_rate: 0.05
+    num_leaves: 63
+    min_child_samples: 40
+    subsample: 0.8
+    subsample_freq: 1
+    colsample_bytree: 0.8
+    early_stopping_rounds: 100
+  lstm:
+    sequence_length: 168
+    hidden_size: 64
+    num_layers: 2
+    dropout: 0.2
+    batch_size: 256
+    max_epochs: 30
+    learning_rate: 0.001
+    early_stopping_patience: 5
+
+mlflow:
+  # Defaults to a local file store so M1 runs without any server; the compose
+  # stack overrides this with the MLflow server URI.
+  tracking_uri: ${MLFLOW_TRACKING_URI:-file:./mlruns}
+  experiment_name: citibike-demand
+  registered_model_name: citibike-demand-forecaster
+  production_alias: production
+
+promotion:
+  # A challenger only replaces the champion if it beats it by this relative
+  # margin on the holdout metric. Prevents churn from noise.
+  min_relative_improvement: 0.02
+  # If there is no champion yet, the best candidate is promoted unconditionally.
+  metric: mae
+
+monitoring:
+  # monitor_dag triggers retrain_dag when either threshold is breached.
+  rolling_mae_window_hours: 24
+  mae_threshold: 4.0                  # absolute rolling MAE ceiling
+  mae_degradation_ratio: 1.5          # or: 1.5x the training-time holdout MAE
+  drift_share_threshold: 0.3          # share of drifted features (Evidently)
+  min_samples_for_evaluation: 200
+
+ingestion:
+  poll_interval_minutes: 5
+  # --- Demand proxy correction parameters (see derive_departures.py) ---
+  # These bound the inventory-delta proxy. They do NOT make it true demand.
+  proxy:
+    # Ignore deltas across snapshots where the station was not rentable.
+    require_is_renting: true
+    require_is_installed: true
+    # A drop larger than this in one interval is almost certainly a
+    # rebalancing van, not organic demand.
+    max_plausible_drop_per_interval: 10
+    # Reject snapshot pairs separated by more than this (missed polls make
+    # the delta uninterpretable as a single interval of demand).
+    max_interval_gap_minutes: 20
+    # Stations whose last_reported is older than this are reporting stale
+    # inventory; their deltas are not trustworthy.
+    max_staleness_minutes: 30
