@@ -214,6 +214,34 @@ def run_promotion(
         min_relative_improvement=margin,
     )
     logger.info("Promotion decision: %s", decision.reason)
+
     if decision.promote and decision.challenger is not None:
-        registry.promote(decision.challenger, decision)
+        version = registry.promote(decision.challenger, decision)
+        # A promotion swaps the model behind a live API, so it is worth telling
+        # someone about. Wrapped because a mail outage must not turn a
+        # successful promotion into a failed training run.
+        try:
+            from src.alerting.email import send_promotion_alert
+
+            send_promotion_alert(
+                {
+                    "model_name": registry.model_name,
+                    "model_version": version,
+                    "model_kind": decision.challenger.name,
+                    "metric": metric,
+                    "challenger_score": decision.challenger_score,
+                    "champion_score": decision.champion_score,
+                    "relative_improvement": (
+                        f"{decision.relative_improvement:.2%}"
+                        if decision.relative_improvement is not None
+                        else "n/a (first model)"
+                    ),
+                    "reason": decision.reason,
+                    "label_provenance": decision.challenger.extra.get("label_provenance"),
+                },
+                cfg,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Promotion succeeded but the alert failed to send: %s", exc)
+
     return decision

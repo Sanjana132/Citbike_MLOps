@@ -168,6 +168,80 @@ python -m scripts.bootstrap_db
 MLFLOW_TRACKING_URI=http://localhost:5001 python -m src.models.train --source offline
 ```
 
+### Email alerts on model change
+
+A promotion silently swaps the model behind a live API, so `promote.py` emails
+the configured recipients whenever the production alias moves. Recipients live
+in `config.yaml` (`alerting.email.recipients`, currently `skomma18@umd.edu`) and
+can be overridden at runtime with `ALERT_EMAIL_RECIPIENTS`.
+
+SMTP credentials come **only** from the environment — never from the committed
+config:
+
+```bash
+SMTP_HOST=smtp.gmail.com     # leave unset to disable sending
+SMTP_PORT=587                # 465 switches to implicit SSL, else STARTTLS
+SMTP_USERNAME=you@gmail.com
+SMTP_PASSWORD=<app password> # Gmail needs an App Password, not the account one
+```
+
+Two guarantees, both tested:
+
+- **It never breaks a promotion.** Every failure path is caught. A dead mail
+  server must not turn a successful model promotion into a failed training run.
+- **It never claims a delivery it did not make.** With SMTP unconfigured it logs
+  `SMTP is not configured ... would have emailed <address>` and returns `False`,
+  rather than reporting success.
+
+The alert carries the new version, model type, the as-served challenger and
+champion scores, and the improvement. If the model was trained on blended labels
+it also carries a prominent warning that its accuracy is measured against the
+demand **proxy**, not true ride counts.
+
+---
+
+## Latency
+
+Measured end to end against the running container, `POST /predict` for all 40
+clusters:
+
+| | before | after |
+|---|---|---|
+| **Median warm request** | ~310 ms | **23 ms** (~13x faster) |
+| Cold request | 1.37 s | 0.35 s |
+
+The profile showed the model was never the bottleneck — the plumbing was:
+
+| stage | before | after |
+|---|---|---|
+| `load_recent_history` | 157 ms | **0 ms** (cached) |
+| `_load_weather` | 134 ms | **0 ms** (cached) |
+| `build_feature_panel` | 38 ms | 16 ms |
+| `model.predict` | 39 ms | 1 ms |
+| prediction logging | on the response path | moved off it |
+
+What changed:
+
+1. **The history query returned the whole table.** The serving path needs a
+   trailing slice anchored on the *newest observation*, which can be weeks
+   behind wall-clock now. It did that with a wide read plus a 730-day fallback
+   read, transferring ~2.6M rows to keep the tail. `read_latest_hourly_departures`
+   anchors the window in SQL instead — one query, filtered in the database.
+2. **Weather was fetched over HTTP on every single request**, costing more than
+   inference itself. Hourly forecasts do not change between requests seconds
+   apart, so both history and weather are now TTL-cached
+   (`serving.history_cache_seconds`, `serving.weather_cache_seconds`). The
+   ingestion DAG invalidates the history cache when it writes, so the TTL is an
+   upper bound on staleness rather than a fixed delay.
+3. **Prediction logging blocked the response** on two database writes. It now
+   runs in a FastAPI background task: forecasting is the service's job,
+   bookkeeping is not.
+
+Caching freshness is not hidden. `/health` reports `postgres` only when the
+newest observation is within `serving.history_freshness_hours` (6h); otherwise
+it reports `postgres_stale` and degrades. Every response still carries
+`history_lag_hours`.
+
 | Service | URL |
 |---|---|
 | Prediction API (docs at `/docs`) | http://localhost:8000 |

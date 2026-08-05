@@ -73,7 +73,9 @@ class DemandModelWrapper(mlflow.pyfunc.PythonModel):
         return np.clip(np.asarray(raw, dtype=float), 0.0, None)
 
 
-def to_model_input(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+def to_model_input(
+    frame: pd.DataFrame, features: list[str], model: Any | None = None
+) -> pd.DataFrame:
     """The single definition of what a model is fed at inference time.
 
     Every consumer goes through here - the API, the drift simulator, and the
@@ -81,16 +83,50 @@ def to_model_input(frame: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     feature builder: two code paths constructing model input differently is how
     train/serve skew gets in.
 
-    Concretely, this pins the dtype contract. Model signatures are inferred from
-    a float64 example so that features read back out of the JSONB ``features``
-    table (all float after a JSON round-trip) are accepted; MLflow's schema
-    enforcement then rejects int64 input as an unsafe conversion. Casting here
-    keeps both directions working.
+    Concretely, this pins the dtype contract. Newer models are logged with an
+    all-double signature so that features read back out of the JSONB ``features``
+    table (all float after a JSON round-trip) are accepted. But models registered
+    *before* that change declare integer columns, and MLflow's schema enforcement
+    rejects float64 against them just as firmly as it rejects int64 against a
+    double schema. Blindly casting to float64 would therefore break every model
+    already in the registry.
+
+    So when the loaded model is supplied, its own declared input schema decides
+    the dtypes; float64 is only the fallback when no schema is available.
     """
     missing = [c for c in features if c not in frame.columns]
     if missing:
         raise ValueError(f"Cannot build model input; missing columns: {missing[:10]}")
-    return frame[features].astype("float64")
+
+    matrix = frame[features]
+    schema_dtypes = _declared_input_dtypes(model)
+    if not schema_dtypes:
+        return matrix.astype("float64")
+
+    return matrix.astype(
+        {c: schema_dtypes[c] for c in matrix.columns if c in schema_dtypes}, copy=False
+    )
+
+
+def _declared_input_dtypes(model: Any | None) -> dict[str, str]:
+    """Column dtypes from a loaded pyfunc model's input signature, if any.
+
+    Returns an empty mapping for anything unreadable - a model with no signature
+    is served with the float64 default rather than failing.
+    """
+    if model is None:
+        return {}
+    try:
+        schema = model.metadata.get_input_schema()
+        if schema is None:
+            return {}
+        names = schema.input_names()
+        pandas_types = schema.pandas_types()
+        if not names or len(names) != len(pandas_types):
+            return {}
+        return {name: str(dtype) for name, dtype in zip(names, pandas_types, strict=True)}
+    except Exception:  # noqa: BLE001 - an unreadable signature just means "use the default"
+        return {}
 
 
 def build_artifacts(

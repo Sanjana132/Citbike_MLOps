@@ -10,13 +10,28 @@ hidden, because serving on stale history is a degraded state, not a normal one.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import pandas as pd
 
 from src.config import Config, data_dir, load_config
 
 logger = logging.getLogger(__name__)
+
+# Hourly departures change at most once an hour, but every prediction re-read
+# them. The cache is keyed on the requested window and guarded by a lock so
+# concurrent requests do not stampede the database.
+_CACHE: dict[int, tuple[float, HistoryResult]] = {}
+_CACHE_LOCK = threading.Lock()
+
+
+def invalidate_history_cache() -> None:
+    """Drop cached history. Called after ingestion writes new rows."""
+    with _CACHE_LOCK:
+        _CACHE.clear()
 
 
 @dataclass
@@ -40,37 +55,58 @@ def _minimum_history_hours(config: Config) -> int:
 
 
 def load_recent_history(
-    config: Config | None = None, *, hours: int | None = None
+    config: Config | None = None, *, hours: int | None = None, use_cache: bool = True
 ) -> HistoryResult:
-    """Load recent hourly departures, preferring the database."""
+    """Load recent hourly departures, preferring the database.
+
+    Results are cached for ``serving.history_cache_seconds``. The underlying
+    table only gains rows when the ingestion DAG runs, so re-reading it on every
+    prediction was pure overhead - it was the single largest cost in a request.
+    """
     cfg = config or load_config()
     window_hours = hours or _minimum_history_hours(cfg)
-    window_days = max(1, int(window_hours / 24) + 1)
+    ttl = float(cfg.get_path("serving.history_cache_seconds", 300))
 
+    if use_cache and ttl > 0:
+        with _CACHE_LOCK:
+            entry = _CACHE.get(window_hours)
+        if entry and (time.monotonic() - entry[0]) < ttl:
+            return entry[1]
+
+    result = _load_history_uncached(cfg, window_hours)
+
+    if use_cache and ttl > 0 and not result.is_empty:
+        with _CACHE_LOCK:
+            _CACHE[window_hours] = (time.monotonic(), result)
+    return result
+
+
+def _load_history_uncached(cfg: Config, window_hours: int) -> HistoryResult:
+    """Actually hit the database (or fall back), bypassing the cache."""
     try:
-        from src.storage.db import read_hourly_departures
+        from src.storage.db import read_latest_hourly_departures
 
-        frame = read_hourly_departures(window_days=window_days, config=cfg)
+        # One SQL query, anchored on the newest observation. This replaces a
+        # recent-window read plus a 730-day fallback read that between them
+        # transferred the whole table just to keep its tail.
+        frame = read_latest_hourly_departures(window_hours, config=cfg)
         if not frame.empty:
-            return HistoryResult(frame, "postgres", pd.Timestamp(frame["hour_ts"].max()))
-
-        # The recent window is empty, but the database may still hold older
-        # history - which is exactly the situation when the ingestion DAG has not
-        # run yet and only the trip-CSV backfill is loaded. Widen the lookback
-        # and take the newest slice, rather than falling through to the parquet
-        # cache and pretending the database had nothing.
-        stale_lookback_days = int(cfg.get_path("serving.stale_history_lookback_days", 730))
-        frame = read_hourly_departures(window_days=stale_lookback_days, config=cfg)
-        if not frame.empty:
-            cutoff = frame["hour_ts"].max() - pd.Timedelta(hours=window_hours)
-            frame = frame[frame["hour_ts"] >= cutoff]
-            logger.warning(
-                "No recent history in the database; serving from the newest "
-                "available slice ending %s", frame["hour_ts"].max(),
-            )
-            return HistoryResult(
-                frame, "postgres_stale", pd.Timestamp(frame["hour_ts"].max())
-            )
+            latest = pd.Timestamp(frame["hour_ts"].max())
+            now = pd.Timestamp(datetime.now(tz=UTC)).tz_localize(None)
+            # "Stale" is about how old the newest observation is, not about
+            # which query found it. The threshold is deliberately tight: with
+            # ingestion polling every 5 minutes, data hours old means the
+            # pipeline is broken, and calling that "fresh" would hide it.
+            # Reusing the lag window (336h) here would let two-week-old data
+            # pass as current.
+            freshness_hours = float(cfg.get_path("serving.history_freshness_hours", 6))
+            fresh = (now - latest) <= pd.Timedelta(hours=freshness_hours)
+            if not fresh:
+                logger.warning(
+                    "No recent history in the database; serving from the newest "
+                    "available slice ending %s", latest,
+                )
+            return HistoryResult(frame, "postgres" if fresh else "postgres_stale", latest)
         logger.warning("Database returned no hourly departures; trying the parquet cache")
     except Exception as exc:  # noqa: BLE001 - fall back rather than fail the request
         logger.warning("Database history unavailable (%s); trying the parquet cache", exc)

@@ -226,6 +226,49 @@ def read_station_info(config: Config | None = None, engine: Engine | None = None
     )
 
 
+def read_latest_hourly_departures(
+    window_hours: int,
+    config: Config | None = None,
+    engine: Engine | None = None,
+) -> pd.DataFrame:
+    """The most recent ``window_hours`` of departures, anchored on the newest row.
+
+    The serving path needs a trailing slice relative to the *latest observation*,
+    not to wall-clock now, because the two can be weeks apart. Doing that with a
+    wide `window_days` read and trimming in pandas meant transferring the whole
+    2.6M-row table to discard almost all of it - the single largest cost in a
+    prediction request. Anchoring in SQL moves the filter to the database.
+    """
+    engine = engine or get_engine()
+    query = text(
+        "SELECT station_short_name, hour_ts, SUM(departures) AS departures "
+        "FROM hourly_departures "
+        "WHERE hour_ts >= ("
+        "  SELECT MAX(hour_ts) - CAST(:window AS interval) FROM hourly_departures"
+        ") "
+        "GROUP BY station_short_name, hour_ts "
+        "ORDER BY station_short_name, hour_ts"
+    )
+    if is_sqlite(engine):
+        # SQLite has no interval type; it stores timestamps as text.
+        query = text(
+            "SELECT station_short_name, hour_ts, SUM(departures) AS departures "
+            "FROM hourly_departures "
+            "WHERE hour_ts >= datetime((SELECT MAX(hour_ts) FROM hourly_departures), "
+            "                          '-' || :window_hours || ' hours') "
+            "GROUP BY station_short_name, hour_ts "
+            "ORDER BY station_short_name, hour_ts"
+        )
+        params: dict[str, object] = {"window_hours": int(window_hours)}
+    else:
+        params = {"window": f"{int(window_hours)} hours"}
+
+    frame = pd.read_sql(query, engine, params=params)
+    if not frame.empty:
+        frame["hour_ts"] = pd.to_datetime(frame["hour_ts"])
+    return frame
+
+
 def read_hourly_departures(
     window_days: int = 90,
     config: Config | None = None,

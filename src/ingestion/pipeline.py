@@ -104,6 +104,16 @@ def derive_and_store_proxy_departures(
         return {"rows_written": 0}
 
     written = write_hourly_departures(complete, label_source="gbfs_proxy")
+
+    # New rows landed, so any cached serving history is now out of date. The
+    # cache TTL is only an upper bound; this makes fresh data visible at once.
+    try:
+        from src.serving.history import invalidate_history_cache
+
+        invalidate_history_cache()
+    except Exception as exc:  # noqa: BLE001 - cache invalidation is never critical
+        logger.debug("Could not invalidate the serving history cache: %s", exc)
+
     quality = proxy_quality_report(intervals)
     logger.info("Wrote %d proxy hourly departure rows; quality=%s", written, quality)
     return {"rows_written": written, **quality}

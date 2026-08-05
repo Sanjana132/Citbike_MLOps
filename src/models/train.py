@@ -163,7 +163,7 @@ def score_as_served(model_uri: str, dataset: Dataset) -> dict[str, float]:
 
     served = mlflow.pyfunc.load_model(model_uri)
     x_test, y_test = dataset.xy("test")
-    predictions = served.predict(to_model_input(x_test, dataset.features))
+    predictions = served.predict(to_model_input(x_test, dataset.features, served))
     return regression_metrics(y_test, predictions)
 
 

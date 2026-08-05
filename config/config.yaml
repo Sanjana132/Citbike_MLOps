@@ -127,6 +127,29 @@ serving:
   # historical backfill is loaded and live ingestion has not started.
   stale_history_lookback_days: 730
 
+  # --- Latency ---
+  # Hourly departures only change when the ingestion DAG runs, and hourly
+  # weather forecasts change less often than requests arrive, yet both were
+  # fetched on every prediction. Together they were ~290ms of a ~380ms request.
+  # The ingestion DAG invalidates the history cache when it writes, so this TTL
+  # is an upper bound on staleness, not a fixed delay.
+  history_cache_seconds: 300
+  weather_cache_seconds: 900
+  # How recent the newest observation must be for history to count as fresh.
+  # Ingestion polls every 5 minutes, so anything hours old means the pipeline
+  # has stopped and /health should say so rather than report "ok".
+  history_freshness_hours: 6
+
+alerting:
+  email:
+    enabled: true
+    # Notified whenever the production model changes. Override at runtime with
+    # ALERT_EMAIL_RECIPIENTS (comma separated) without editing this file.
+    # SMTP credentials live in the environment only - never here, this is
+    # committed.
+    recipients:
+      - skomma18@umd.edu
+
 monitoring:
   # monitor_dag triggers retrain_dag when either threshold is breached.
   rolling_mae_window_hours: 24

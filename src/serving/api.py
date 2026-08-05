@@ -19,12 +19,14 @@ never fails the request: forecasting is the service's job, bookkeeping is not.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import load_config
@@ -177,8 +179,36 @@ def _resolve_target_hour(requested: datetime | None, latest_observed: pd.Timesta
     return pd.Timestamp(latest_observed).floor("h") + pd.Timedelta(hours=1), warnings
 
 
+_WEATHER_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_WEATHER_LOCK = threading.Lock()
+
+
 def _load_weather(history_hours: pd.Series, target_hour: pd.Timestamp) -> pd.DataFrame:
-    """Weather covering both the history window and the forecast hour."""
+    """Weather covering both the history window and the forecast hour.
+
+    Cached for ``serving.weather_cache_seconds``. The uncached version made a
+    live HTTP call to NOAA (or Open-Meteo) on *every* prediction, which cost
+    more than the model inference itself. Hourly forecasts do not change between
+    requests a few seconds apart, so paying that round trip each time bought
+    nothing.
+    """
+    ttl = float(config.get_path("serving.weather_cache_seconds", 900))
+    key = f"{pd.Timestamp(history_hours.min()):%Y%m%d}-{target_hour:%Y%m%d%H}"
+    if ttl > 0:
+        with _WEATHER_LOCK:
+            entry = _WEATHER_CACHE.get(key)
+        if entry and (time.monotonic() - entry[0]) < ttl:
+            return entry[1]
+
+    frame = _fetch_weather(history_hours, target_hour)
+    if ttl > 0 and not frame.empty:
+        with _WEATHER_LOCK:
+            _WEATHER_CACHE[key] = (time.monotonic(), frame)
+    return frame
+
+
+def _fetch_weather(history_hours: pd.Series, target_hour: pd.Timestamp) -> pd.DataFrame:
+    """Uncached weather fetch: archive for the history window, live for ahead."""
     from src.ingestion.weather import empty_weather_frame, load_live_weather, weather_window_for
 
     frames = []
@@ -266,7 +296,7 @@ def reload_model() -> dict[str, Any]:
 
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(request: PredictRequest) -> PredictResponse:
+def predict(request: PredictRequest, background: BackgroundTasks) -> PredictResponse:
     bundle = loader.bundle
     if bundle is None:
         try:
@@ -352,7 +382,7 @@ def predict(request: PredictRequest) -> PredictResponse:
 
     from src.models.pyfunc_wrapper import to_model_input
 
-    features = to_model_input(rows, feature_columns(config))
+    features = to_model_input(rows, feature_columns(config), bundle.model)
     try:
         predicted = bundle.model.predict(features)
     except Exception as exc:  # noqa: BLE001
@@ -374,7 +404,9 @@ def predict(request: PredictRequest) -> PredictResponse:
             )
 
     if request.log_prediction:
-        _log_prediction(result, rows, target_hour, bundle)
+        # Off the response path: bookkeeping for the monitoring loop must not
+        # make callers wait on two database writes.
+        background.add_task(_log_prediction, result, rows, target_hour, bundle)
 
     return PredictResponse(
         target_hour=target_hour.to_pydatetime(),
