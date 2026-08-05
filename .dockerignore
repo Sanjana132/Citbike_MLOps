@@ -1,0 +1,26 @@
+# Keep the build context small. data/ alone is several GB of cached parquet and
+# is mounted as a volume at runtime, so shipping it into the image is pure waste.
+data/
+mlruns/
+mlartifacts/
+logs/
+.airflow/
+notebooks/
+reports/
+
+.git/
+.github/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+.env
+*.zip
+*.parquet
+.DS_Store
+.vscode/
+.idea/
