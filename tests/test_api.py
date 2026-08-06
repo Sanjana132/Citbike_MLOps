@@ -8,6 +8,7 @@ it degrades honestly instead of returning confident nonsense.
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -62,6 +63,11 @@ def client(monkeypatch, station_info, hourly_departures, config):
     monkeypatch.setattr(api_module, "_load_weather", lambda hours, target: pd.DataFrame())
     # Prediction logging is exercised separately; keep these tests DB-free.
     monkeypatch.setattr(api_module, "_log_prediction", lambda *a, **k: None)
+    # Liveness hits the database; it has its own tests in test_liveness.py.
+    monkeypatch.setattr(
+        "src.monitoring.liveness.check_pipeline_liveness",
+        lambda cfg=None: SimpleNamespace(healthy=True, summary=lambda: "fresh"),
+    )
 
     with TestClient(api_module.app) as test_client:
         yield test_client
@@ -73,6 +79,25 @@ def test_health_reports_ok_when_everything_is_available(client):
     assert body["model_loaded"] is True
     assert body["model_version"] == "7"
     assert body["history_source"] == "postgres"
+    assert body["pipeline_live"] is True
+
+
+def test_health_degrades_when_ingestion_has_stalled(monkeypatch, client):
+    """A stalled pipeline must show up here, not only in the hourly DAG.
+
+    This is the signal that was missing when ingestion stopped for 42 hours
+    while every other check reported healthy.
+    """
+    monkeypatch.setattr(
+        "src.monitoring.liveness.check_pipeline_liveness",
+        lambda cfg=None: SimpleNamespace(
+            healthy=False, summary=lambda: "gbfs_snapshots: newest row is 2520 min old"
+        ),
+    )
+    body = client.get("/health").json()
+    assert body["status"] == "degraded"
+    assert body["pipeline_live"] is False
+    assert any("stalled" in w for w in body["warnings"])
 
 
 def test_model_info_exposes_provenance_and_version(client):

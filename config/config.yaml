@@ -170,6 +170,16 @@ monitoring:
   drift_share_threshold: 0.3          # share of drifted features (Evidently)
   min_samples_for_evaluation: 200
 
+  # Pipeline liveness. Drift and error monitoring answer "is the model good?";
+  # they cannot answer "is the pipeline running?", because both need NEW data to
+  # detect anything and a stalled pipeline produces none. A stale bind mount
+  # once stopped ingestion for 42 hours with every other check reporting green.
+  liveness:
+    alert_enabled: true
+    # Generous multiples of the 5-minute poll, so one missed run is not a page.
+    snapshot_max_age_minutes: 30
+    departures_max_age_minutes: 180
+
   # Minimum gap between automatic retrains. Drift usually persists until a new
   # model is serving, so an hourly monitor would queue a fresh retrain every
   # hour and build a backlog that never drains - observed on this stack before

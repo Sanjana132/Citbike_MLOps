@@ -102,6 +102,7 @@ class HealthResponse(BaseModel):
     model_loaded: bool
     model_version: str | None = None
     history_source: str | None = None
+    pipeline_live: bool | None = None
     warnings: list[str] = []
     detail: str | None = None
 
@@ -243,6 +244,19 @@ def health() -> HealthResponse:
 
     warnings: list[str] = []
 
+    # Surfaced here as well as in monitor_dag so a stalled pipeline is visible
+    # immediately, rather than at the top of the next hour.
+    pipeline_live: bool | None = None
+    try:
+        from src.monitoring.liveness import check_pipeline_liveness
+
+        liveness = check_pipeline_liveness(config)
+        pipeline_live = liveness.healthy
+        if not liveness.healthy:
+            warnings.append(f"Ingestion may have stalled - {liveness.summary()}")
+    except Exception as exc:  # noqa: BLE001 - health must answer even if this fails
+        logger.warning("Liveness check failed during /health: %s", exc)
+
     history = load_recent_history(config)
     if history.source == "parquet_cache":
         warnings.append(
@@ -260,6 +274,7 @@ def health() -> HealthResponse:
             status="degraded",
             model_loaded=False,
             history_source=history.source,
+            pipeline_live=pipeline_live,
             warnings=warnings,
             detail=loader.last_error or "No production model loaded",
         )
@@ -269,6 +284,7 @@ def health() -> HealthResponse:
         model_loaded=True,
         model_version=bundle.model_version,
         history_source=history.source,
+        pipeline_live=pipeline_live,
         warnings=warnings,
     )
 

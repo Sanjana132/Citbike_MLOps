@@ -168,6 +168,40 @@ python -m scripts.bootstrap_db
 MLFLOW_TRACKING_URI=http://localhost:5001 python -m src.models.train --source offline
 ```
 
+### Pipeline liveness alerts
+
+Drift and error monitoring answer *"is the model still good?"*. Neither can
+answer *"is the pipeline still running?"* — and the difference is not academic.
+
+Ingestion on this stack once stopped for **42 hours with every other signal
+green**: the Airflow bind mounts went stale, `/opt/airflow/dags` became empty
+inside the container, Airflow quietly marked every DAG inactive, and nothing
+noticed. Containers were healthy, the API served predictions, the scheduler
+heartbeat was fine. The model checks stayed silent precisely *because* they need
+new data to detect anything, and none was arriving:
+
+- No fresh predictions to score, so rolling MAE stopped updating rather than
+  degrading.
+- No fresh features, so drift reported "not evaluated" — easy to read as "fine".
+
+`src/monitoring/liveness.py` checks the newest row in each table directly.
+`monitor_dag` runs it hourly ahead of the model checks and emails on breach;
+`/health` reports it live via `pipeline_live`:
+
+```json
+{
+  "status": "degraded",
+  "pipeline_live": false,
+  "warnings": ["Ingestion may have stalled - hourly_departures (proxy):
+                newest row is 2739 min old, over the 180 min threshold"]
+}
+```
+
+Thresholds are generous multiples of the poll interval
+(`monitoring.liveness.*`), so one missed run does not page anyone. The alert
+states explicitly that **retraining will not fix an ingestion outage**, so
+nobody reaches for the wrong lever.
+
 ### Email alerts on model change
 
 A promotion silently swaps the model behind a live API, so `promote.py` emails
@@ -425,10 +459,13 @@ Engineering notes worth knowing:
    rather than true accuracy.
 3. **`--source blend` does not work on this data yet.** Trip CSVs end
    2026-06-30 and live ingestion began 2026-08-03, leaving a 33-day hole, so a
-   split window lands inside it and training aborts with a clear diagnostic. Use
-   `--source offline` until the ingestion DAG has bridged the gap. This is
-   deliberately a loud failure — see the gap-fill note below for what the
-   alternative cost.
+   split window lands inside it and training aborts with a clear diagnostic.
+   `retrain_dag` therefore uses `run_training_with_fallback`: it attempts
+   `blend` and falls back to `offline` (true trip-CSV labels) when the blended
+   data is unusable, logging the fallback loudly and flagging it on the run
+   summary. An automatically triggered retrain has to be able to finish on its
+   own — aborting would leave the loop permanently open. Manual CLI runs still
+   fail loudly rather than falling back silently.
 4. **Three months of training data** (Apr–Jun) means no seasonal coverage — the
    model has never seen winter, and `season` is nearly constant in training.
 5. **A single 14-day test window** carries real variance; there is no rolling-

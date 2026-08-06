@@ -286,6 +286,41 @@ def train_deep_candidate(
 # Orchestration
 # --------------------------------------------------------------------------
 
+def run_training_with_fallback(
+    source: str = "blend",
+    fallback_source: str = "offline",
+    **kwargs,
+) -> dict:
+    """Train on ``source``, falling back to ``fallback_source`` if it is unusable.
+
+    The retraining loop is triggered automatically, so it has to be able to
+    finish without a human. ``blend`` cannot run while a multi-week hole sits
+    between the trip CSVs and live ingestion, and a retrain that always aborts
+    is not a closed loop - it is an alert nobody can action. Falling back to
+    ``offline`` (true trip-CSV labels) produces a genuinely trained model rather
+    than no model at all.
+
+    The fallback is loud: it is logged as a warning and recorded on the returned
+    summary, so nobody mistakes a fallback run for a normal one.
+    """
+    try:
+        result = run_training(source=source, **kwargs)
+        result["fell_back"] = False
+        return result
+    except ValueError as exc:
+        # Only data-shape failures are worth retrying differently. A genuine bug
+        # should surface, not be masked by a second training run.
+        logger.warning(
+            "Training on source=%r failed (%s); retrying with source=%r",
+            source, exc, fallback_source,
+        )
+        result = run_training(source=fallback_source, **kwargs)
+        result["fell_back"] = True
+        result["fallback_reason"] = str(exc)
+        result["attempted_source"] = source
+        return result
+
+
 def run_training(
     source: str = "offline",
     window_days: int | None = None,

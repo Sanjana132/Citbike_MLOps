@@ -47,23 +47,33 @@ def retrain_dag():
         """
         from airflow.operators.python import get_current_context
 
-        from src.models.train import run_training
+        from src.models.train import run_training_with_fallback
 
         conf = (get_current_context().get("dag_run").conf or {}) if get_current_context().get("dag_run") else {}
         source = conf.get("source", "blend")
         logging.info("Retraining with source=%s (conf=%s)", source, conf)
 
-        result = run_training(
+        # Falls back to trip-CSV labels if the blended data is unusable. An
+        # automatically triggered retrain has to be able to finish on its own;
+        # aborting would leave the loop permanently open.
+        result = run_training_with_fallback(
             source=source,
+            fallback_source=conf.get("fallback_source", "offline"),
             window_days=conf.get("window_days"),
             config=config,
             promote=True,
         )
+        if result.get("fell_back"):
+            logging.warning(
+                "Retrained on the fallback source; %r was unusable: %s",
+                source, result.get("fallback_reason"),
+            )
         return {
             "promoted": result["promoted"],
             "reason": result["promotion_reason"],
             "candidates": {k: v.get("mae") for k, v in result["candidates"].items()},
             "label_provenance": result["label_provenance"],
+            "fell_back": result.get("fell_back", False),
         }
 
     @task

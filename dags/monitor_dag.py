@@ -32,6 +32,18 @@ config = load_config()
 )
 def monitor_dag():
     @task
+    def check_liveness() -> dict:
+        """Alert if ingestion has stopped.
+
+        Runs before the model checks and independently of them: a stalled
+        pipeline is an operational failure that retraining cannot fix, and it
+        makes the drift/error signals meaningless rather than alarming.
+        """
+        from src.monitoring.liveness import alert_on_stalled_pipeline
+
+        return alert_on_stalled_pipeline(config).as_dict()
+
+    @task
     def evaluate() -> dict:
         """Score recent predictions and measure drift."""
         from src.monitoring.pipeline import run_monitoring_cycle
@@ -62,8 +74,10 @@ def monitor_dag():
         reset_dag_run=True,
     )
 
+    liveness = check_liveness()
     result = evaluate()
     branch = decide(result)
+    liveness >> result
     branch >> [trigger_retrain, no_action()]
 
 
