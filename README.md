@@ -232,6 +232,24 @@ champion scores, and the improvement. If the model was trained on blended labels
 it also carries a prominent warning that its accuracy is measured against the
 demand **proxy**, not true ride counts.
 
+The SMTP path is verified end to end against a local mail server — a real
+message was transmitted and received, correctly addressed:
+
+```
+Subject: [citibike-mlops] citibike-demand-forecaster v3 promoted to production (lightgbm)
+To: skomma18@umd.edu
+
+  Model            : citibike-demand-forecaster
+  New version      : 3
+  Challenger score : 21.5
+  Previous champion: 24.566
+  Improvement      : 12.48%
+```
+
+What is **not** verified is delivery through a real provider, because no
+external SMTP credentials are configured on this machine. Supply them and the
+same path applies unchanged.
+
 ---
 
 ## Latency
