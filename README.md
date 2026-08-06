@@ -126,11 +126,18 @@ Every figure below is **as-served**: the model was loaded back through
 |---|---|---|---|---|---|
 | **LightGBM** (Poisson) — **champion** | **24.57** | 51.82 | 22.80% | 24.57 | **0.0%** |
 | LSTM (deep candidate) | 39.27 | 92.53 | 40.66% | 22.25 | **+76.5%** |
+| LSTM, independent rerun in Airflow | 39.47 | 91.36 | — | 22.79 | +73.2% |
 | Seasonal naive (same hour, last week) | 46.13 | — | — | — | — |
 
 LightGBM is **47% better than the seasonal-naive baseline**. Mean demand is
 ~161 departures per cluster-hour, so MAE 24.6 is roughly 15% of the mean. Its
 serving path reproduces its holdout exactly — a 0.0% gap.
+
+LightGBM is bit-for-bit reproducible: **24.5660 across five independent runs**,
+on the host and inside the Airflow container. The LSTM is not — 22.25 vs 22.79
+in-process across environments, since torch determinism does not hold across
+differing thread counts. Its conclusion is unchanged either way: as-served it is
+worse than the naive baseline.
 
 **The LSTM is registered but not promoted, and that is the correct outcome.**
 Its in-process score of 22.25 would have beaten LightGBM by 9.45%, and on an
@@ -341,6 +348,28 @@ error trigger correctly did **not** fire — rolling MAE (23.84) was slightly
 *better* than the training holdout MAE (24.57) — while the drift trigger did.
 That is the complementarity the two-trigger design is for.
 
+**And the retrain itself completes autonomously.** A full `retrain_dag` run in
+Airflow, start to finish in 14 minutes, with no human in the loop:
+
+```
+WARNING Training on source='blend' failed (... 33 days 13:00:00 gap ...);
+        retrying with source='offline'
+INFO    LightGBM:   as-served test MAE=24.5660 (in-process 24.5660)
+WARNING Deep model: as-served MAE 39.4733 differs from in-process 22.7873 by
+        73.2% - the serving path does not reproduce the holdout
+INFO    Promotion decision: Best challenger lightgbm changed mae by 0.00%,
+        which does not clear the 2.00% bar; keeping the current champion
+Returned: {'promoted': False, 'fell_back': True, ...}
+```
+
+Every safeguard fired in the right order: the gap diagnostic, the fallback, the
+serving-gap warning, and a promotion correctly declined. Both tasks
+(`train_and_promote`, `refresh_serving`) succeeded.
+
+`monitor_dag` likewise runs all five tasks green, including the new
+`check_liveness`, which detected the stalled proxy stream and attempted the
+alert.
+
 Because the simulation's timestamps are historical and the monitor's window is
 measured backwards from now, `simulate_drift` shifts its rows forward by a whole
 number of weeks (preserving hour-of-day and day-of-week). It fabricates rows by
@@ -524,6 +553,14 @@ kind that stay silent:
 - **A retrain storm**: drift persists until a new model serves, so an hourly
   monitor queued a retrain every hour. Three had stacked up before the cooldown
   was added.
+- **The auto-retrain could never finish.** `retrain_dag` defaults to `blend`,
+  which the 33-day gap makes unusable, so all four early runs failed. An
+  automatically triggered retrain that always aborts is not a closed loop; it
+  now falls back to trip-CSV labels and completes.
+- **A 42-hour silent ingestion outage.** Stale bind mounts emptied
+  `/opt/airflow/dags`; Airflow marked every DAG inactive and nothing noticed,
+  because drift and error monitoring need new data to detect anything. Liveness
+  checks now cover it.
 
 The suite is hermetic — verified by running it with `socket.connect` blocked,
 not merely asserted.
