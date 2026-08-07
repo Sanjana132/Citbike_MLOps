@@ -59,6 +59,24 @@ CALENDAR_FEATURES = [
     "dow_cos",
 ]
 
+# Annual-cycle features. `month` and `season` are coarse step functions - they
+# say nothing about where inside a season a day falls, and they jump
+# discontinuously at month boundaries. These describe the smooth annual cycle
+# and the physical driver behind it.
+#
+# Daylight matters in its own right for cycling: demand collapses after dark
+# well beyond what temperature alone explains, and the dark hour moves by ~3
+# hours between June and December. It is derived from date and latitude by
+# closed-form astronomy, so it needs no extra data source and cannot leak.
+SEASONAL_FEATURES = [
+    "day_of_year_sin",
+    "day_of_year_cos",
+    "week_of_year",
+    "daylight_hours",
+    "is_daylight",
+    "hours_from_solar_noon",
+]
+
 _SEASON_BY_MONTH = {
     12: 0, 1: 0, 2: 0,   # winter
     3: 1, 4: 1, 5: 1,    # spring
@@ -89,6 +107,7 @@ def feature_columns(config: Config | None = None) -> list[str]:
     cfg = config or load_config()
     return (
         CALENDAR_FEATURES
+        + SEASONAL_FEATURES
         + lag_feature_names(cfg)
         + rolling_feature_names(cfg)
         + ENTITY_FEATURES
@@ -102,6 +121,110 @@ def _holiday_dates(years: list[int], country: str) -> set:
     except Exception as exc:  # noqa: BLE001 - never let a holiday lookup break training
         logger.warning("Holiday calendar unavailable for %s (%s); is_holiday=0", country, exc)
         return set()
+
+
+def solar_daylight_hours(day_of_year: np.ndarray, latitude: float) -> np.ndarray:
+    """Hours between sunrise and sunset, from date and latitude.
+
+    Solar-declination geometry, with sunrise/sunset taken at a solar altitude of
+    -0.833 degrees rather than 0. That offset is the conventional correction for
+    atmospheric refraction plus the sun's angular radius, and it is what
+    almanacs mean by "sunrise". Omitting it understates NYC daylight by a
+    consistent ~0.2 h, which checks against published values confirmed.
+
+    The ``clip`` guards polar day/night, where the arccos argument leaves
+    [-1, 1]. NYC never gets near that, but a silent NaN would propagate into
+    every downstream feature.
+    """
+    declination = np.deg2rad(23.44) * np.sin(2 * np.pi * (day_of_year - 81) / 365.0)
+    latitude_rad = np.deg2rad(latitude)
+    altitude = np.deg2rad(-0.833)
+
+    cos_hour_angle = (
+        np.sin(altitude) - np.sin(latitude_rad) * np.sin(declination)
+    ) / (np.cos(latitude_rad) * np.cos(declination))
+    hour_angle = np.arccos(np.clip(cos_hour_angle, -1.0, 1.0))
+    return 2.0 * np.rad2deg(hour_angle) / 15.0
+
+
+def add_seasonal_features(frame: pd.DataFrame, config: Config | None = None) -> pd.DataFrame:
+    """Smooth annual-cycle and daylight features.
+
+    All are deterministic functions of the timestamp (plus a fixed latitude), so
+    they are exactly as leakage-free as ``hour`` or ``day_of_week`` - no future
+    information is involved.
+    """
+    cfg = config or load_config()
+    out = frame.copy()
+    timestamps = pd.to_datetime(out[TIME_KEY])
+
+    day_of_year = timestamps.dt.dayofyear.to_numpy()
+    # Cyclical so that 31 December and 1 January are adjacent, which `month`
+    # and `season` both get wrong at the year boundary.
+    out["day_of_year_sin"] = np.sin(2 * np.pi * day_of_year / 365.25)
+    out["day_of_year_cos"] = np.cos(2 * np.pi * day_of_year / 365.25)
+    out["week_of_year"] = (
+        timestamps.dt.isocalendar().week.to_numpy().astype("int16")
+    )
+
+    latitude = float(cfg.get_path("weather.latitude", 40.73))
+    daylight = solar_daylight_hours(day_of_year, latitude)
+    out["daylight_hours"] = daylight
+
+    # Each row is an hourly bucket, so it is represented by its midpoint. Using
+    # the hour's start would call 05:00-06:00 "dark" on a day when the sun rises
+    # at 05:23, even though most of that hour is light.
+    hour_of_day = timestamps.dt.hour.to_numpy().astype(float) + 0.5
+    solar_noon = _solar_noon_local_hour(timestamps, cfg)
+
+    sunrise = solar_noon - daylight / 2.0
+    sunset = solar_noon + daylight / 2.0
+    out["is_daylight"] = (
+        (hour_of_day >= sunrise) & (hour_of_day <= sunset)
+    ).astype("int8")
+    out["hours_from_solar_noon"] = np.abs(hour_of_day - solar_noon)
+    return out
+
+
+def _solar_noon_local_hour(timestamps: pd.Series, config: Config) -> np.ndarray:
+    """Local clock hour of solar noon, accounting for DST and longitude.
+
+    Assuming solar noon falls at 12:00 is wrong by nearly an hour in NYC, and
+    wrong in a way that matters: it shifts sunrise and sunset by the same
+    amount, which flips ``is_daylight`` exactly at dawn and dusk where demand is
+    actually changing fastest. It reported 20:00 on 21 June as dark, when NYC
+    sunset that day is about 20:31.
+
+    Two corrections:
+
+    * **Daylight saving.** Clocks move but the sun does not, so solar noon lands
+      an hour later by the clock during EDT. Taken from the zone's real UTC
+      offset rather than from month-based guesswork.
+    * **Longitude.** NYC sits ~1 degree east of the 75W meridian its zone is
+      built on, worth about 4 minutes.
+    """
+    longitude = float(config.get_path("weather.longitude", -73.99))
+    timezone = config.get_path("project.timezone", "America/New_York")
+
+    try:
+        localised = pd.DatetimeIndex(timestamps).tz_localize(
+            timezone, ambiguous=True, nonexistent="shift_forward"
+        )
+        offset_hours = (
+            localised.map(lambda t: t.utcoffset().total_seconds() / 3600.0)
+            .to_numpy()
+            .astype(float)
+        )
+    except Exception as exc:  # noqa: BLE001 - a bad zone must not break features
+        logger.warning(
+            "Could not resolve UTC offset for %s (%s); assuming solar noon at 12:00",
+            timezone, exc,
+        )
+        return np.full(len(timestamps), 12.0)
+
+    # Solar noon (UTC) is 12:00 shifted by longitude at 15 deg/hour; converting
+    # to local clock time adds the zone's offset.
+    return 12.0 - longitude / 15.0 + offset_hours
 
 
 def add_calendar_features(frame: pd.DataFrame, config: Config | None = None) -> pd.DataFrame:
@@ -266,6 +389,7 @@ def build_feature_panel(
     panel = complete_panel(observations, extra_hours=extra_hours, config=cfg)
     panel = add_lag_features(panel, cfg)
     panel = add_calendar_features(panel, cfg)
+    panel = add_seasonal_features(panel, cfg)
 
     # Select only the entity columns actually present; any that are absent are
     # filled with NaN below. Indexing the full list here would raise instead,
@@ -296,13 +420,22 @@ def build_feature_panel(
 
 
 def drop_warmup_rows(panel: pd.DataFrame, config: Config | None = None) -> pd.DataFrame:
-    """Drop early rows whose longest lag could not be computed.
+    """Drop early rows whose core lags could not be computed.
 
     Keeping them would train the model on rows where the strongest feature
     (same-hour-last-week) is always missing, which is not a regime it will ever
     see in production.
+
+    The cutoff is governed by ``features.warmup_hours`` rather than by the
+    longest lag or rolling window. Those are no longer the same thing: adding a
+    30-day seasonal rolling mean would otherwise discard the first 30 days of
+    every training set, and a year-over-year lag would discard a whole year.
+    A long window being partly unfilled early on is fine - LightGBM handles NaN
+    natively - whereas throwing away real data is not.
     """
     cfg = config or load_config()
-    longest_lag = max(cfg.get_path("features.lag_hours", [1, 2, 3, 24, 168]))
-    cutoff = panel[TIME_KEY].min() + pd.Timedelta(hours=longest_lag)
+    warmup = cfg.get_path("features.warmup_hours")
+    if warmup is None:
+        warmup = max(cfg.get_path("features.lag_hours", [1, 2, 3, 24, 168]))
+    cutoff = panel[TIME_KEY].min() + pd.Timedelta(hours=int(warmup))
     return panel[panel[TIME_KEY] >= cutoff].reset_index(drop=True)

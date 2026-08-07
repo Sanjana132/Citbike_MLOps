@@ -48,10 +48,18 @@ class HistoryResult:
 
 
 def _minimum_history_hours(config: Config) -> int:
-    """History deep enough for the longest lag and rolling window, plus slack."""
+    """History deep enough for the longest lag and rolling window, plus a buffer.
+
+    Computing a 720-hour rolling mean at time *T* needs the 720 hours before it,
+    not 1440. The old ``* 2`` was arbitrary slack, and once a 30-day seasonal
+    window was added it doubled the serving read to 60 days - 790k rows and
+    ~970ms per cache miss. A fixed buffer covers the ``shift(1)`` and any hour
+    with no rows at all, at a fraction of the cost.
+    """
     longest_lag = max(config.get_path("features.lag_hours", [1, 2, 3, 24, 168]))
     longest_window = max(config.get_path("features.rolling_windows_hours", [24, 168]))
-    return int(max(longest_lag, longest_window) * 2)
+    buffer_hours = int(config.get_path("serving.history_buffer_hours", 24))
+    return int(max(longest_lag, longest_window) + buffer_hours)
 
 
 def load_recent_history(

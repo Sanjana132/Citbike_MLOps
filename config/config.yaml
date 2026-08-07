@@ -22,7 +22,21 @@ trip_history:
   # months are split across several part files inside one zip.
   bucket_index_url: https://s3.amazonaws.com/tripdata/
   # Months to train the initial model on (most recent complete months).
+  # 14 months, so training covers all four seasons. Three spring/summer months
+  # left `season` almost constant and the model had never seen winter - it could
+  # not learn the annual cycle it was being asked to forecast.
   months:
+    - "202505"
+    - "202506"
+    - "202507"
+    - "202508"
+    - "202509"
+    - "202510"
+    - "202511"
+    - "202512"
+    - "202601"
+    - "202602"
+    - "202603"
     - "202604"
     - "202605"
     - "202606"
@@ -63,7 +77,13 @@ features:
   # began, and filling it with zeros fabricates weeks of no demand.
   max_gap_fill_hours: 24
   lag_hours: [1, 2, 3, 24, 168]
-  rolling_windows_hours: [24, 168]
+  # 720h (30 days) tracks the slow seasonal level - how busy this part of the
+  # year is - which the 24h and 168h windows are far too short to see.
+  rolling_windows_hours: [24, 168, 720]
+  # Warmup is now decoupled from the longest window. Tying it to the maximum
+  # would throw away the first 30 days of every training set to fill a rolling
+  # mean, when LightGBM handles the partial window as NaN perfectly well.
+  warmup_hours: 168
   holiday_country: US
 
 training:
@@ -139,6 +159,10 @@ serving:
   # Ingestion polls every 5 minutes, so anything hours old means the pipeline
   # has stopped and /health should say so rather than report "ok".
   history_freshness_hours: 6
+  # Extra history beyond the longest lag/rolling window, covering the shift(1)
+  # and any hours with no rows. Kept small: every extra hour is rows read on a
+  # cache miss.
+  history_buffer_hours: 24
 
 alerting:
   email:

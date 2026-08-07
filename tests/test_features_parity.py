@@ -41,14 +41,26 @@ def test_serving_reproduces_training_features_exactly(observations, mapping, wea
     """
     training_panel = build_feature_panel(observations, mapping.entities, weather, config)
 
-    # Serving path: only the trailing 3 weeks of history are available.
-    cutoff = observations[TIME_KEY].max() - pd.Timedelta(days=21)
+    # Serving keeps only a trailing window. Its size is taken from the serving
+    # layer itself rather than hardcoded, because it is derived from the feature
+    # config: adding a 30-day rolling mean widened it from 14 to 60 days, and a
+    # hardcoded 21 days silently stopped covering the longest feature. That is a
+    # real contract, so the test tracks it instead of guessing.
+    from src.serving.history import _minimum_history_hours
+
+    window_hours = _minimum_history_hours(config)
+    cutoff = observations[TIME_KEY].max() - pd.Timedelta(hours=window_hours)
     recent = observations[observations[TIME_KEY] > cutoff]
     serving_panel = build_feature_panel(recent, mapping.entities, weather, config)
 
-    # Compare only rows far enough into the serving window that its longest lag
-    # (168h) is fully populated - before that, serving genuinely has less history.
-    comparable_from = recent[TIME_KEY].min() + pd.Timedelta(hours=168)
+    # Compare only rows far enough into the serving window that every lag and
+    # rolling window is fully populated - before that, serving genuinely has
+    # less history and the two are not expected to agree.
+    lookback = max(
+        max(config.get_path("features.lag_hours")),
+        max(config.get_path("features.rolling_windows_hours")),
+    )
+    comparable_from = recent[TIME_KEY].min() + pd.Timedelta(hours=lookback)
     features = feature_columns(config)
 
     left = (
