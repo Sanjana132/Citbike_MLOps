@@ -115,7 +115,7 @@ on one night compared against a three-month hourly average.
 
 ## Results
 
-Trained on **May 2025 – Jun 2026**: 14 months, 63.9M trips, ~2,300 stations,
+Trained on **May 2025 – Jun 2026**: 14 months, 54.6M trips, 2,436 stations,
 aggregated to 40 geographic clusters. Test set is the final 14 days, held out
 chronologically. Every figure is **as-served** — the model is loaded back
 through `mlflow.pyfunc` and scored through the path that actually serves it.
