@@ -68,13 +68,15 @@ CALENDAR_FEATURES = [
 # well beyond what temperature alone explains, and the dark hour moves by ~3
 # hours between June and December. It is derived from date and latitude by
 # closed-form astronomy, so it needs no extra data source and cannot leak.
+# Grouped so each can be enabled independently - they were measured separately
+# and they do not behave the same way. See `seasonal_feature_names`.
+SEASONAL_FEATURE_GROUPS = {
+    "annual_cycle": ["day_of_year_sin", "day_of_year_cos", "week_of_year"],
+    "daylight": ["daylight_hours", "is_daylight", "hours_from_solar_noon"],
+}
+# Every seasonal column this module can produce, enabled or not.
 SEASONAL_FEATURES = [
-    "day_of_year_sin",
-    "day_of_year_cos",
-    "week_of_year",
-    "daylight_hours",
-    "is_daylight",
-    "hours_from_solar_noon",
+    name for group in SEASONAL_FEATURE_GROUPS.values() for name in group
 ]
 
 _SEASON_BY_MONTH = {
@@ -98,6 +100,46 @@ def rolling_feature_names(config: Config | None = None) -> list[str]:
     return names
 
 
+def seasonal_feature_names(config: Config | None = None) -> list[str]:
+    """Seasonal columns that are actually fed to the model.
+
+    Defaults to **none**, which is a measured decision rather than caution.
+    Trained on 14 months, adding these made the model *worse* on a held-out
+    fortnight (LightGBM, identical data and split):
+
+        base (no seasonal)      MAE 20.034
+        + 30-day rolling only   MAE 19.978   -0.28%
+        + daylight only         MAE 20.795   +3.80%
+        + annual cycle only     MAE 21.163   +5.64%
+        + all seasonal          MAE 20.984   +4.74%
+
+    They ranked among the most-used features while making predictions worse,
+    which is the signature of memorisation rather than learning. With ~14 months
+    each calendar date occurs once or twice, so `day_of_year` can key directly
+    on "late June 2025" instead of learning an annual shape - and late June 2025
+    is not late June 2026. Daylight fails the same way, being a deterministic
+    function of day-of-year.
+
+    The 30-day rolling mean, which tracks the *recent* level rather than
+    position in the year, is the one piece that did not hurt; it stays on.
+
+    Enable these once the training window spans several years, where an annual
+    cycle can be estimated instead of memorised.
+    """
+    cfg = config or load_config()
+    enabled = cfg.get_path("features.seasonal_feature_groups", []) or []
+    names: list[str] = []
+    for group in enabled:
+        if group not in SEASONAL_FEATURE_GROUPS:
+            logger.warning(
+                "Unknown seasonal feature group %r; known groups: %s",
+                group, sorted(SEASONAL_FEATURE_GROUPS),
+            )
+            continue
+        names.extend(SEASONAL_FEATURE_GROUPS[group])
+    return names
+
+
 def feature_columns(config: Config | None = None) -> list[str]:
     """The exact ordered feature list the model consumes.
 
@@ -107,7 +149,7 @@ def feature_columns(config: Config | None = None) -> list[str]:
     cfg = config or load_config()
     return (
         CALENDAR_FEATURES
-        + SEASONAL_FEATURES
+        + seasonal_feature_names(cfg)
         + lag_feature_names(cfg)
         + rolling_feature_names(cfg)
         + ENTITY_FEATURES

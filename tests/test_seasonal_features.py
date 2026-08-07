@@ -157,18 +157,82 @@ def test_seasonal_features_are_deterministic_from_the_timestamp():
     pd.testing.assert_frame_equal(first[SEASONAL_FEATURES], second[SEASONAL_FEATURES])
 
 
-def test_seasonal_features_are_in_the_model_contract(config):
+def test_seasonal_groups_are_off_by_default(config):
+    """Measured, not cautious: both groups made the model worse on 14 months.
+
+    annual_cycle cost +5.64% MAE and daylight +3.80%, while ranking among the
+    most-used features - memorisation, not learning.
+    """
+    from src.features.build_features import seasonal_feature_names
+
+    assert seasonal_feature_names(config) == []
     columns = feature_columns(config)
     for name in SEASONAL_FEATURES:
-        assert name in columns
+        assert name not in columns
+    # The 30-day rolling window is the piece that did not hurt; it stays.
+    assert "roll_mean_720h" in columns
 
 
-def test_seasonal_features_reach_the_panel(hourly_departures, mapping, weather, config):
+def test_enabling_a_group_adds_exactly_its_features(config):
+    from src.features.build_features import (
+        SEASONAL_FEATURE_GROUPS,
+        seasonal_feature_names,
+    )
+
+    original = config["features"].get("seasonal_feature_groups", [])
+    try:
+        config["features"]["seasonal_feature_groups"] = ["daylight"]
+        assert seasonal_feature_names(config) == SEASONAL_FEATURE_GROUPS["daylight"]
+        assert "daylight_hours" in feature_columns(config)
+        assert "day_of_year_sin" not in feature_columns(config)
+
+        config["features"]["seasonal_feature_groups"] = ["annual_cycle", "daylight"]
+        assert set(seasonal_feature_names(config)) == set(SEASONAL_FEATURES)
+    finally:
+        config["features"]["seasonal_feature_groups"] = original
+
+
+def test_unknown_group_is_ignored_with_a_warning(config):
+    """A typo must not silently change the feature contract."""
+    from src.features.build_features import seasonal_feature_names
+
+    original = config["features"].get("seasonal_feature_groups", [])
+    try:
+        config["features"]["seasonal_feature_groups"] = ["daylite"]
+        assert seasonal_feature_names(config) == []
+    finally:
+        config["features"]["seasonal_feature_groups"] = original
+
+
+def test_disabled_seasonal_columns_stay_out_of_the_panel(
+    hourly_departures, mapping, weather, config
+):
+    """The panel carries exactly the feature contract and nothing else.
+
+    Leaving unselected columns in would let a model be trained on features that
+    `feature_columns()` does not advertise - the two must not diverge.
+    """
     observations = aggregate_to_entities(hourly_departures, mapping)
     panel = build_feature_panel(observations, mapping.entities, weather, config)
+
+    assert list(panel.columns) == ["entity_id", TIME_KEY, TARGET_COLUMN] + feature_columns(config)
     for name in SEASONAL_FEATURES:
-        assert name in panel.columns
-        assert panel[name].notna().all(), f"{name} should never be NaN"
+        assert name not in panel.columns
+
+
+def test_enabled_seasonal_columns_reach_the_panel_fully_populated(
+    hourly_departures, mapping, weather, config
+):
+    observations = aggregate_to_entities(hourly_departures, mapping)
+    original = config["features"].get("seasonal_feature_groups", [])
+    try:
+        config["features"]["seasonal_feature_groups"] = ["annual_cycle", "daylight"]
+        panel = build_feature_panel(observations, mapping.entities, weather, config)
+        for name in SEASONAL_FEATURES:
+            assert name in panel.columns
+            assert panel[name].notna().all(), f"{name} should never be NaN"
+    finally:
+        config["features"]["seasonal_feature_groups"] = original
 
 
 # --------------------------------------------------------------------------

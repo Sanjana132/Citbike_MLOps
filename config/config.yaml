@@ -80,6 +80,14 @@ features:
   # 720h (30 days) tracks the slow seasonal level - how busy this part of the
   # year is - which the 24h and 168h windows are far too short to see.
   rolling_windows_hours: [24, 168, 720]
+  # Seasonal feature groups to enable: annual_cycle, daylight.
+  # Empty by DEFAULT because both were measured to make the model worse on 14
+  # months of data (annual_cycle +5.64% MAE, daylight +3.80%): with each date
+  # seen only once or twice they memorise specific dates rather than learn the
+  # annual shape. The 30-day rolling window below is the part that helped, and
+  # it stays on. Turn these on once training spans several years.
+  seasonal_feature_groups: []
+
   # Warmup is now decoupled from the longest window. Tying it to the maximum
   # would throw away the first 30 days of every training set to fill a rolling
   # mean, when LightGBM handles the partial window as NaN perfectly well.
