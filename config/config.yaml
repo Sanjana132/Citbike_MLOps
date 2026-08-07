@@ -238,7 +238,27 @@ monitoring:
     - season
 
 ingestion:
+  # How often the DAG runs.
   poll_interval_minutes: 5
+  # Samples taken per run, one minute apart. The feed advances last_updated
+  # every 60s and snapshot_ts comes from that field, so a single poll per run
+  # captured one update in five. That left ~12 intervals an hour against a
+  # 50%-coverage guard, so minor scheduler lag discarded whole hours - proxy
+  # departures stalled for a day while snapshots kept arriving. Sampling every
+  # minute gives ~60 intervals an hour, so a fully missed run costs 5 of 60,
+  # and shorter intervals also mean less demand nets out inside them.
+  # 4 samples = 3 sleeps of 60s plus fetches, about 3.2 min inside a 5-minute
+  # schedule. Deliberately not 5: that would leave under a minute of headroom,
+  # and with max_active_runs=1 an overrunning run delays the next one, which
+  # cascades. This yields ~48 of 60 intervals an hour, well clear of the 50%
+  # coverage guard, and the :03 -> :05 gap across runs stays inside
+  # max_interval_gap_minutes.
+  samples_per_run: 4
+  sample_spacing_seconds: 60
+  # Snapshots are raw material for the hourly proxy, not a long-term record.
+  # At ~2,460 stations x 60 samples an hour they accumulate ~3.5M rows a day,
+  # so they are pruned once the hours they feed have been derived.
+  snapshot_retention_days: 3
   # --- Demand proxy correction parameters (see derive_departures.py) ---
   # These bound the inventory-delta proxy. They do NOT make it true demand.
   proxy:
@@ -248,9 +268,12 @@ ingestion:
     # A drop larger than this in one interval is almost certainly a
     # rebalancing van, not organic demand.
     max_plausible_drop_per_interval: 10
-    # Reject snapshot pairs separated by more than this (missed polls make
-    # the delta uninterpretable as a single interval of demand).
-    max_interval_gap_minutes: 20
+    # Reject snapshot pairs separated by more than this (missed samples make
+    # the delta uninterpretable as a single interval of demand). Tightened from
+    # 20 to 3 now that sampling is per-minute: a pair spanning more than a few
+    # minutes means samples were missed, and the wider the gap the more demand
+    # nets out inside it unseen.
+    max_interval_gap_minutes: 3
     # Stations whose last_reported is older than this are reporting stale
     # inventory; their deltas are not trustworthy.
     max_staleness_minutes: 30

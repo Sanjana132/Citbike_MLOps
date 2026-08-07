@@ -187,8 +187,66 @@ def test_ingest_status_reports_zero_on_an_empty_feed(monkeypatch, config):
     monkeypatch.setattr(
         GBFSClient, "fetch_station_status", lambda self, snapshot_ts=None: pd.DataFrame()
     )
-    result = pipeline.ingest_station_status(config)
+    # Inject a no-op sleep: the loop's behaviour is under test, not the delay.
+    result = pipeline.ingest_station_status(config, sleep=lambda _: None)
     assert result["snapshots_written"] == 0
+
+
+def test_ingest_takes_several_samples_per_run(monkeypatch, config):
+    """One sample per run captured only a fifth of the feed's updates.
+
+    The feed advances last_updated every 60s, so a single poll every 5 minutes
+    left ~12 intervals an hour against a 50% coverage guard - a little scheduler
+    lag then discarded whole hours.
+    """
+    from src.ingestion import pipeline
+    from src.storage import db
+
+    calls = {"fetch": 0, "sleeps": []}
+
+    def fake_fetch(self, snapshot_ts=None):
+        calls["fetch"] += 1
+        stamp = pd.Timestamp("2026-08-01T12:00:00Z") + pd.Timedelta(minutes=calls["fetch"])
+        return pd.DataFrame(
+            {"station_id": ["a"], "snapshot_ts": [stamp], "num_bikes_available": [5]}
+        )
+
+    monkeypatch.setattr(GBFSClient, "fetch_station_status", fake_fetch)
+    monkeypatch.setattr(db, "write_status_snapshots", lambda frame, *a, **k: len(frame))
+
+    expected = int(config.get_path("ingestion.samples_per_run"))
+    spacing = float(config.get_path("ingestion.sample_spacing_seconds"))
+    result = pipeline.ingest_station_status(config, sleep=calls["sleeps"].append)
+
+    assert calls["fetch"] == expected
+    assert result["distinct_timestamps"] == expected
+    # Sleeps happen between samples, never after the last one - the next
+    # scheduled run continues the sequence.
+    assert calls["sleeps"] == [spacing] * (expected - 1)
+
+
+def test_one_failed_sample_does_not_lose_the_others(monkeypatch, config):
+    """A transient GBFS error must cost one sample, not the whole run."""
+    from src.ingestion import pipeline
+    from src.storage import db
+
+    state = {"n": 0}
+
+    def flaky_fetch(self, snapshot_ts=None):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise RuntimeError("transient upstream failure")
+        stamp = pd.Timestamp("2026-08-01T12:00:00Z") + pd.Timedelta(minutes=state["n"])
+        return pd.DataFrame(
+            {"station_id": ["a"], "snapshot_ts": [stamp], "num_bikes_available": [5]}
+        )
+
+    monkeypatch.setattr(GBFSClient, "fetch_station_status", flaky_fetch)
+    monkeypatch.setattr(db, "write_status_snapshots", lambda frame, *a, **k: len(frame))
+
+    expected = int(config.get_path("ingestion.samples_per_run"))
+    result = pipeline.ingest_station_status(config, sleep=lambda _: None)
+    assert result["snapshots_written"] == expected - 1
 
 
 def test_derive_step_defers_the_in_progress_hour(monkeypatch, config, snapshots):

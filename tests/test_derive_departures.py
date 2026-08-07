@@ -38,11 +38,11 @@ def test_netting_understates_true_demand(config):
     frame = pd.DataFrame(
         {
             "station_id": ["s1", "s1"],
-            "snapshot_ts": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:05:00Z"]),
+            "snapshot_ts": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:01:00Z"]),
             "num_bikes_available": [20, 19],
             "is_renting": [1, 1],
             "is_installed": [1, 1],
-            "last_reported": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:05:00Z"]),
+            "last_reported": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:01:00Z"]),
         }
     )
     result = derive_interval_departures(frame, config)
@@ -75,11 +75,11 @@ def test_implausible_drop_is_capped_as_rebalancing(config):
     frame = pd.DataFrame(
         {
             "station_id": ["s1", "s1"],
-            "snapshot_ts": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:05:00Z"]),
+            "snapshot_ts": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:01:00Z"]),
             "num_bikes_available": [20, 5],
             "is_renting": [1, 1],
             "is_installed": [1, 1],
-            "last_reported": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:05:00Z"]),
+            "last_reported": pd.to_datetime(["2026-08-01T12:00:00Z", "2026-08-01T12:01:00Z"]),
         }
     )
     cap = float(config.get_path("ingestion.proxy.max_plausible_drop_per_interval"))
@@ -131,20 +131,35 @@ def test_empty_and_malformed_input_do_not_raise(config):
     assert derive_interval_departures(malformed, config).empty
 
 
-def test_hourly_aggregation_drops_low_coverage_hours(snapshots, config):
-    """Three surviving intervals must not be reported as a full hour of demand."""
-    intervals = derive_interval_departures(snapshots, config)
-    station_info = pd.DataFrame(
-        {"station_id": ["uuid-a", "uuid-b"], "short_name": ["1001.01", "1002.01"]}
-    )
+def test_hourly_aggregation_drops_low_coverage_hours(config):
+    """A handful of intervals must not be reported as a full hour of demand.
 
-    # 12 intervals of an expected 12 -> full coverage, kept.
-    hourly = aggregate_proxy_to_hourly(intervals, station_info, config)
-    assert not hourly.empty
-    assert set(hourly["station_short_name"]) == {"1001.01", "1002.01"}
+    Coverage is measured against the SAMPLING resolution (~60 intervals an hour
+    at one sample a minute), not against the DAG schedule.
+    """
+    station_info = pd.DataFrame({"station_id": ["uuid-a"], "short_name": ["1001.01"]})
 
-    # Keep only 3 intervals -> 25% coverage, dropped.
-    sparse = intervals.groupby("station_id", as_index=False).head(3)
+    def snapshots_for(minutes: int) -> pd.DataFrame:
+        times = pd.date_range("2026-08-01T12:00:00Z", periods=minutes + 1, freq="1min")
+        return pd.DataFrame(
+            {
+                "station_id": "uuid-a",
+                "snapshot_ts": times,
+                "num_bikes_available": range(50, 50 - len(times), -1),
+                "is_renting": 1,
+                "is_installed": 1,
+                "last_reported": times,
+            }
+        )
+
+    # A well-covered hour (50 of ~60 intervals) is kept.
+    dense = derive_interval_departures(snapshots_for(50), config)
+    kept = aggregate_proxy_to_hourly(dense, station_info, config)
+    assert not kept.empty
+    assert set(kept["station_short_name"]) == {"1001.01"}
+
+    # Ten intervals is under the 50% guard and must be discarded.
+    sparse = derive_interval_departures(snapshots_for(10), config)
     assert aggregate_proxy_to_hourly(sparse, station_info, config).empty
 
 

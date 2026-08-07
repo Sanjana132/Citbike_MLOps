@@ -218,6 +218,29 @@ def write_model_metrics(record: dict, engine: Engine | None = None) -> None:
 # Reads
 # --------------------------------------------------------------------------
 
+def prune_status_snapshots(retention_days: int, engine: Engine | None = None) -> int:
+    """Delete snapshots older than the retention window.
+
+    Snapshots are raw material for the hourly proxy, not a long-term record:
+    once the hours they feed have been derived into ``hourly_departures`` they
+    are dead weight. At ~2,460 stations sampled every minute they accumulate
+    roughly 3.5M rows a day, so without pruning the table would dominate the
+    database within a week.
+    """
+    if retention_days <= 0:
+        return 0
+    engine = engine or get_engine()
+    cutoff = datetime.now(tz=UTC) - timedelta(days=retention_days)
+    with engine.begin() as connection:
+        deleted = connection.execute(
+            text("DELETE FROM status_snapshots WHERE snapshot_ts < :cutoff"),
+            {"cutoff": cutoff},
+        ).rowcount
+    if deleted:
+        logger.info("Pruned %d status snapshots older than %d days", deleted, retention_days)
+    return int(deleted or 0)
+
+
 def read_station_info(config: Config | None = None, engine: Engine | None = None) -> pd.DataFrame:
     engine = engine or get_engine()
     return pd.read_sql(

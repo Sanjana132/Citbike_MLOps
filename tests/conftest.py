@@ -75,8 +75,12 @@ def weather() -> pd.DataFrame:
 
 @pytest.fixture
 def snapshots() -> pd.DataFrame:
-    """Two stations polled every 5 minutes for one hour."""
-    times = pd.date_range("2026-08-01T12:00:00Z", periods=13, freq="5min")
+    """Two stations sampled once a minute.
+
+    Matches production: each ingest run takes several samples 60s apart, so
+    intervals are minutes rather than the 5-minute polls of the original design.
+    """
+    times = pd.date_range("2026-08-01T12:00:00Z", periods=13, freq="1min")
     rows = []
     for station_id, inventory in (
         ("uuid-a", [20, 19, 18, 18, 16, 15, 15, 14, 13, 13, 12, 11, 10]),
