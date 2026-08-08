@@ -225,6 +225,38 @@ def test_ingest_takes_several_samples_per_run(monkeypatch, config):
     assert calls["sleeps"] == [spacing] * (expected - 1)
 
 
+def test_run_budget_ends_the_cycle_instead_of_blocking_the_next(monkeypatch, config):
+    """A slow feed must cost samples, not an hour of ingestion.
+
+    One fetch once hung for 67 minutes - `requests` applies its timeout per
+    socket read, so a trickling server holds the connection far longer than the
+    configured 30s. With max_active_runs=1 that blocked every run behind it.
+    """
+    import time as time_module
+
+    from src.ingestion import pipeline
+    from src.storage import db
+
+    clock = {"now": 0.0}
+    monkeypatch.setattr(time_module, "monotonic", lambda: clock["now"])
+
+    def slow_fetch(self, snapshot_ts=None):
+        clock["now"] += 500.0  # each fetch overruns the whole budget
+        stamp = pd.Timestamp("2026-08-01T12:00:00Z") + pd.Timedelta(seconds=clock["now"])
+        return pd.DataFrame(
+            {"station_id": ["a"], "snapshot_ts": [stamp], "num_bikes_available": [5]}
+        )
+
+    monkeypatch.setattr(GBFSClient, "fetch_station_status", slow_fetch)
+    monkeypatch.setattr(db, "write_status_snapshots", lambda frame, *a, **k: len(frame))
+
+    result = pipeline.ingest_station_status(config, sleep=lambda _: None)
+
+    # It stops early rather than working through every sample.
+    assert result["snapshots_written"] < int(config.get_path("ingestion.samples_per_run"))
+    assert result["snapshots_written"] >= 1, "a partial cycle still writes what it got"
+
+
 def test_one_failed_sample_does_not_lose_the_others(monkeypatch, config):
     """A transient GBFS error must cost one sample, not the whole run."""
     from src.ingestion import pipeline

@@ -205,16 +205,19 @@ def aggregate_proxy_to_hourly(
     if interval_departures.empty:
         return pd.DataFrame(columns=["station_short_name", "hour_ts", "departures", "n_intervals"])
 
-    # Expected intervals follow the SAMPLING resolution, not the DAG schedule.
-    # Each run takes several samples a minute apart, so an hour yields roughly
-    # 3600/spacing intervals rather than 60/poll_interval. Using the schedule
-    # here would understate the expectation ~5x and let badly-covered hours pass.
-    spacing_seconds = float(cfg.get_path("ingestion.sample_spacing_seconds", 0) or 0)
-    if spacing_seconds > 0:
-        expected_intervals = max(1.0, 3600.0 / spacing_seconds)
-    else:
-        poll_minutes = float(cfg.get_path("ingestion.poll_interval_minutes", 5))
-        expected_intervals = max(1.0, 60.0 / poll_minutes)
+    # Expected intervals are what this configuration is DESIGNED to collect:
+    # samples_per_run x runs_per_hour. Two wrong denominators were tried first
+    # and both distort the guard:
+    #
+    #   * runs_per_hour alone ignores multi-sampling and understates ~4x, so
+    #     badly-covered hours sail through.
+    #   * 3600/spacing is the feed's maximum rate, not ours. We sample in bursts
+    #     with gaps between runs, so a perfectly healthy hour scores ~40/60 and
+    #     gets discarded for missing samples it was never going to take.
+    poll_minutes = float(cfg.get_path("ingestion.poll_interval_minutes", 5))
+    samples_per_run = float(cfg.get_path("ingestion.samples_per_run", 1) or 1)
+    runs_per_hour = max(1.0, 60.0 / max(poll_minutes, 1e-6))
+    expected_intervals = max(1.0, samples_per_run * runs_per_hour)
 
     frame = interval_departures.copy()
     frame["interval_end"] = pd.to_datetime(frame["interval_end"], utc=True)

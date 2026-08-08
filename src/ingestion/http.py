@@ -37,7 +37,16 @@ def get_with_retries(
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            response = requests.get(url, timeout=timeout_s, headers=headers, params=params)
+            # (connect, read) rather than one value. Even so, `requests` applies
+            # the read timeout between socket reads, so a server trickling bytes
+            # can exceed it many times over - the caller's wall-clock budget is
+            # the real guard. This just fails faster on a dead connection.
+            response = requests.get(
+                url,
+                timeout=(min(10, timeout_s), timeout_s),
+                headers=headers,
+                params=params,
+            )
             response.raise_for_status()
             return response
         except Exception as exc:  # noqa: BLE001 - deliberately broad, we retry everything

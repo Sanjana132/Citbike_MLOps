@@ -20,6 +20,9 @@ from src.config import load_config
 
 config = load_config()
 POLL_MINUTES = int(config.get_path("ingestion.poll_interval_minutes", 5))
+# Kill a polling task before the next cycle is due, so a stuck run can never
+# block its successors.
+RUN_TIMEOUT_MINUTES = max(2, POLL_MINUTES - 1)
 
 
 @dag(
@@ -39,7 +42,11 @@ def ingest_dag():
 
         return ingest_station_information(config)
 
-    @task
+    # Belt and braces with the in-task budget: if the task wedges somewhere the
+    # budget cannot see (a blocked socket, a stuck DB call), Airflow kills it.
+    # Without this a single hung fetch ran 67 minutes and, with
+    # max_active_runs=1, blocked every scheduled run behind it.
+    @task(execution_timeout=pendulum.duration(minutes=RUN_TIMEOUT_MINUTES))
     def poll_station_status() -> dict:
         from src.ingestion.pipeline import ingest_station_status
 

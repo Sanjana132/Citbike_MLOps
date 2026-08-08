@@ -75,11 +75,29 @@ def ingest_station_status(
     samples = max(1, int(cfg.get_path("ingestion.samples_per_run", 5)))
     spacing_seconds = float(cfg.get_path("ingestion.sample_spacing_seconds", 60))
 
+    # Hard wall-clock budget for the whole run. A single fetch once hung for 67
+    # minutes: `requests` applies its timeout per socket read, so a server that
+    # trickles bytes can hold a connection open far longer than the configured
+    # 30s. With max_active_runs=1 that one stuck run blocked every scheduled run
+    # behind it for over an hour, and ingestion looked dead from the outside.
+    # The budget bounds the damage to a single cycle.
+    budget_seconds = float(
+        cfg.get_path("ingestion.run_budget_seconds", spacing_seconds * samples + 60)
+    )
+    deadline = time.monotonic() + budget_seconds
+
     client = GBFSClient(cfg)
     written = 0
     timestamps: list[str] = []
 
     for index in range(samples):
+        if time.monotonic() > deadline:
+            logger.warning(
+                "Run budget of %.0fs exhausted after %d/%d samples; ending this cycle "
+                "so the next scheduled run is not blocked",
+                budget_seconds, index, samples,
+            )
+            break
         try:
             snapshot = client.fetch_station_status()
         except Exception as exc:  # noqa: BLE001 - one bad sample must not lose the rest
@@ -94,7 +112,7 @@ def ingest_station_status(
 
         # No sleep after the final sample - the next scheduled run continues the
         # sequence, keeping intervals contiguous across run boundaries.
-        if index < samples - 1:
+        if index < samples - 1 and time.monotonic() + spacing_seconds < deadline:
             wait(spacing_seconds)
 
     if not written:
