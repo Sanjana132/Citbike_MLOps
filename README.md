@@ -1,9 +1,34 @@
 # Citi Bike Demand Forecasting — a closed-loop MLOps platform
 
+![Python](https://img.shields.io/badge/python-3.11-blue)
+![Tests](https://img.shields.io/badge/tests-171%20passing-brightgreen)
+![Airflow](https://img.shields.io/badge/Airflow-2.10-017CEE)
+![MLflow](https://img.shields.io/badge/MLflow-2.22-0194E2)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
+![Docker](https://img.shields.io/badge/Docker%20Compose-8%20services-2496ED)
+![License](https://img.shields.io/badge/license-MIT-lightgrey)
+
 Next-hour bike-demand forecasts for the NYC Citi Bike system, with a retraining
 loop that closes itself: when accuracy degrades or the data drifts, the system
 retrains, validates the challenger against the champion, and promotes the winner
 without a human in the path.
+
+**At a glance**
+
+| | |
+|---|---|
+| **Scale** | 54.6M trips, 2,436 stations, 14 months (May 2025 – Jun 2026) |
+| **Accuracy** | Test MAE **20.27** — 56% better than seasonal-naive (46.11) |
+| **Serving** | FastAPI, **23 ms** median (down from ~310 ms) |
+| **Stack** | Airflow · MLflow · FastAPI · Postgres · Evidently · Streamlit · Docker Compose (8 services) |
+| **Quality** | **171 tests**, hermetic (verified with sockets blocked), ruff-clean, GitHub Actions CI |
+
+**The part worth reading:** this README documents what *broke* as carefully as
+what works — a promotion that shipped a model 60% worse than the one it
+replaced, 32,160 rows of fabricated training data, a seasonal feature set that
+measured worse and was removed, and a 42-hour silent ingestion outage. Each is
+written up with the measurement that caught it. Jump to
+[what running it actually caught](#what-running-it-actually-caught).
 
 ---
 
