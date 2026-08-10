@@ -32,3 +32,8 @@ venv/
 
 # The original build brief - kept locally, deliberately not published.
 CLAUDE_CODE_BUILD_PROMPT.txt
+
+# Personal documents - kept out of the repo in case it is ever made public.
+resume/*.docx
+resume/*.pdf
+resume/*.md
