@@ -214,10 +214,11 @@ def aggregate_proxy_to_hourly(
     #   * 3600/spacing is the feed's maximum rate, not ours. We sample in bursts
     #     with gaps between runs, so a perfectly healthy hour scores ~40/60 and
     #     gets discarded for missing samples it was never going to take.
-    poll_minutes = float(cfg.get_path("ingestion.poll_interval_minutes", 5))
-    samples_per_run = float(cfg.get_path("ingestion.samples_per_run", 1) or 1)
-    runs_per_hour = max(1.0, 60.0 / max(poll_minutes, 1e-6))
-    expected_intervals = max(1.0, samples_per_run * runs_per_hour)
+    # With a continuous poller the expected rate is simply the sampling cadence:
+    # it polls on a fixed grid rather than in bursts, so 3600/spacing is what a
+    # healthy hour genuinely produces.
+    spacing_seconds = float(cfg.get_path("ingestion.sample_spacing_seconds", 60) or 60)
+    expected_intervals = max(1.0, 3600.0 / spacing_seconds)
 
     frame = interval_departures.copy()
     frame["interval_end"] = pd.to_datetime(frame["interval_end"], utc=True)

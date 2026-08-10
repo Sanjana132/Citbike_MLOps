@@ -17,19 +17,21 @@ without a human in the path.
                         │  • Open-Meteo / NOAA    (weather)         │
                         └───────────────┬──────────────────────────┘
                                         │
-        ┌───────────────────────────────┼────────────────────────────────┐
-        │                    AIRFLOW (LocalExecutor)                     │
-        │                               │                                │
-        │  ingest_dag (*/5 min)         │      retrain_dag (daily + ⚡)   │
-        │  ├─ poll station_status       │      ├─ blend labels            │
-        │  ├─ derive PROXY departures   │      ├─ train LightGBM + LSTM   │
-        │  └─ write hourly_departures   │      ├─ champion/challenger     │
-        │                               │      └─ promote winner ─────┐   │
-        │  monitor_dag (hourly)         │                             │   │
-        │  ├─ rolling MAE (pred vs real)│                             │   │
-        │  ├─ Evidently feature drift   │                             │   │
-        │  └─ breach? ──TriggerDagRun──⚡┘                             │   │
-        └───────────────────────────────┬─────────────────────────────┼───┘
+  ┌─────────────────────────────┐  ┌──────────────────────────────────────┐
+  │  INGESTOR (always-on svc)   │  │      AIRFLOW (LocalExecutor)         │
+  │  poll station_status /60s   │  │                                      │
+  │  derive PROXY departures    │  │  retrain_dag (daily + ⚡)             │
+  │  write hourly_departures    │  │  ├─ blend labels (falls back)        │
+  │  prune snapshots (3d)       │  │  ├─ train LightGBM + LSTM            │
+  └──────────────┬──────────────┘  │  ├─ champion/challenger (as-served)  │
+                 │                 │  └─ promote winner ───────────────┐  │
+                 │                 │                                   │  │
+                 │                 │  monitor_dag (hourly)             │  │
+                 │                 │  ├─ pipeline liveness -> email    │  │
+                 │                 │  ├─ rolling MAE (pred vs real)    │  │
+                 │                 │  ├─ Evidently feature drift       │  │
+                 │                 │  └─ breach? ──TriggerDagRun──⚡────┘  │
+        ┌────────┴──────────────────┬──────────────────────────────────┼──┘
                                         │                             │
               ┌─────────────────────────┴──────────┐                  │
               │                                    │                  │
@@ -47,6 +49,16 @@ without a human in the path.
       │   STREAMLIT    │  predicted vs realised map · rolling MAE · drift · model version
       └────────────────┘
 ```
+
+**Why ingestion is not a DAG.** The feed refreshes every 60 seconds, and
+Airflow's per-run overhead — scheduling latency, process spawn, DagBag parse —
+is measured in tens of seconds against that. Run as a 5-minute DAG it collapsed:
+over 6 hours only **4 runs completed of an expected 72**, single runs took 1.5–2.5
+hours against a 4-minute `execution_timeout` that never fired, and the scheduler
+lost its heartbeat 10 times in 3 hours. With `max_active_runs=1` one slow run
+blocks every run behind it. Airflow is a batch orchestrator; a 60-second feed is
+a long-running service, so ingestion is one. Airflow keeps the daily retrain and
+hourly monitor, where a minute of jitter is irrelevant.
 
 **The loop, precisely:** `monitor_dag` runs hourly. It joins logged predictions
 to realised demand for rolling MAE, and compares the feature distribution being

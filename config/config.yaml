@@ -238,8 +238,15 @@ monitoring:
     - season
 
 ingestion:
-  # How often the DAG runs.
-  poll_interval_minutes: 5
+  # Ingestion runs as an always-on service (src/ingestion/service.py), NOT as an
+  # Airflow DAG. The feed advances every 60s, and Airflow's per-run overhead -
+  # scheduling latency, process spawn, DagBag parse - is measured in tens of
+  # seconds against that. Measured over 6 hours on this host: 4 runs completed
+  # of an expected 72, single runs took 1.5-2.5 hours against a 4-minute
+  # execution_timeout that never fired, and the scheduler lost its heartbeat 10
+  # times in 3 hours. Airflow keeps the daily retrain and hourly monitor, where
+  # a minute of jitter does not matter.
+  poll_interval_minutes: 5      # retained for the legacy DAG only
   # Samples taken per run, one minute apart. The feed advances last_updated
   # every 60s and snapshot_ts comes from that field, so a single poll per run
   # captured one update in five. That left ~12 intervals an hour against a
@@ -253,8 +260,13 @@ ingestion:
   # cascades. This yields ~48 of 60 intervals an hour, well clear of the 50%
   # coverage guard, and the :03 -> :05 gap across runs stays inside
   # max_interval_gap_minutes.
-  samples_per_run: 4
+  samples_per_run: 4            # legacy DAG only
+  # Poller cadence. Matches the feed's own 60s refresh, giving ~60 intervals an
+  # hour and the shortest intervals the feed can support - which also minimises
+  # the netting bias, since less demand cancels out inside a shorter window.
   sample_spacing_seconds: 60
+  derive_interval_seconds: 300      # roll snapshots into hourly departures
+  station_refresh_seconds: 3600     # static metadata changes slowly
   # Wall-clock ceiling for one ingest cycle. A hung fetch once ran 67 minutes
   # and, with max_active_runs=1, blocked every run behind it. Ending the cycle
   # early costs a few samples; letting it run costs an hour of ingestion.

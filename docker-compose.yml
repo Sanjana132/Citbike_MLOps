@@ -85,6 +85,25 @@ services:
       start_period: 30s
     restart: unless-stopped
 
+  # Always-on GBFS poller. Ingestion is a long-running service, not a batch job:
+  # the feed refreshes every 60s and Airflow's per-run overhead is measured in
+  # tens of seconds against that. See src/ingestion/service.py for the numbers
+  # that drove this out of Airflow.
+  ingestor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: citibike-ingestor
+    environment:
+      <<: *app-env
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "src.ingestion.service"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
   dashboard:
     build:
       context: .
