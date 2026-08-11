@@ -28,6 +28,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_DATABASE_URL = "postgresql+psycopg2://citibike:citibike@localhost:5432/citibike"
 
 _ENGINE: Engine | None = None
+# The URL the cached engine was built from, kept separately and deliberately.
+# Comparing against ``str(_ENGINE.url)`` does NOT work: SQLAlchemy renders the
+# password as "***", so the comparison never matched its own input and every
+# call built a fresh engine and connection pool while leaking the previous one.
+# That leak exhausted Postgres (39 idle connections against max_connections=100)
+# and produced 67-minute hangs in both the Airflow DAG and the poller - stalls
+# that looked for a long time like a scheduling problem.
+_ENGINE_URL: str | None = None
 
 
 def database_url() -> str:
@@ -35,12 +43,46 @@ def database_url() -> str:
 
 
 def get_engine(url: str | None = None) -> Engine:
-    """Process-wide engine, created lazily."""
-    global _ENGINE
+    """Process-wide engine, created lazily and reused.
+
+    One engine per process is the point: each ``create_engine`` call builds its
+    own connection pool, so recreating it per query silently multiplies open
+    connections until the database refuses more.
+    """
+    global _ENGINE, _ENGINE_URL
     resolved = url or database_url()
-    if _ENGINE is None or str(_ENGINE.url) != resolved:
-        _ENGINE = create_engine(resolved, pool_pre_ping=True, future=True)
-        logger.info("Database engine created for %s", _ENGINE.url.render_as_string(hide_password=True))
+
+    if _ENGINE is not None and _ENGINE_URL == resolved:
+        return _ENGINE
+
+    if _ENGINE is not None:
+        # Reconfiguring to a genuinely different URL - release the old pool
+        # rather than orphaning its connections.
+        try:
+            _ENGINE.dispose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not dispose the previous engine: %s", exc)
+
+    options: dict[str, object] = {"pool_pre_ping": True, "future": True}
+    # SQLite uses SingletonThreadPool/StaticPool, which reject these arguments -
+    # and the test suite runs on SQLite, so they must be applied selectively.
+    if not resolved.startswith("sqlite"):
+        options.update(
+            {
+                # Bounded pool: a long-running poller should hold a handful of
+                # connections, not grow without limit.
+                "pool_size": 5,
+                "max_overflow": 5,
+                # Recycle before typical server-side idle timeouts drop the socket.
+                "pool_recycle": 1800,
+            }
+        )
+
+    _ENGINE = create_engine(resolved, **options)
+    _ENGINE_URL = resolved
+    logger.info(
+        "Database engine created for %s", _ENGINE.url.render_as_string(hide_password=True)
+    )
     return _ENGINE
 
 

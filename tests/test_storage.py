@@ -150,3 +150,97 @@ def test_predictions_append_for_audit(engine):
 def test_empty_writes_are_no_ops(engine):
     assert write_station_info(pd.DataFrame(columns=["station_id", "short_name", "name", "lat", "lon", "capacity", "region_id"]), engine) == 0
     assert write_predictions(pd.DataFrame(), engine) == 0
+
+
+# --------------------------------------------------------------------------
+# Engine caching
+# --------------------------------------------------------------------------
+
+def test_engine_is_created_once_and_reused(monkeypatch):
+    """Regression test for the defect behind every ingestion stall.
+
+    The cache check compared ``str(_ENGINE.url)`` against the URL it was built
+    from, but SQLAlchemy renders the password as "***" - so the comparison never
+    matched and each call built a new engine and connection pool while leaking
+    the previous one. It exhausted Postgres (39 idle connections against
+    max_connections=100) and caused 67-minute hangs in both the Airflow DAG and
+    the poller, which looked for a long time like a scheduler problem.
+    """
+    import src.storage.db as module
+
+    monkeypatch.setattr(module, "_ENGINE", None)
+    monkeypatch.setattr(module, "_ENGINE_URL", None)
+    monkeypatch.setenv("DATABASE_URL", "sqlite://")
+
+    created = []
+    real_create = module.create_engine
+
+    def counting_create(*args, **kwargs):
+        created.append(args[0])
+        return real_create(*args, **kwargs)
+
+    monkeypatch.setattr(module, "create_engine", counting_create)
+
+    first = module.get_engine()
+    for _ in range(20):
+        assert module.get_engine() is first
+
+    assert len(created) == 1, f"engine rebuilt {len(created)} times; the pool leaks"
+
+
+def test_password_bearing_url_still_hits_the_cache(monkeypatch):
+    """The exact shape that broke: a URL containing a password.
+
+    Without a separately stored URL this matched "***" and missed every time.
+    """
+    import src.storage.db as module
+
+    monkeypatch.setattr(module, "_ENGINE", None)
+    monkeypatch.setattr(module, "_ENGINE_URL", None)
+
+    url = "postgresql+psycopg2://user:secret@localhost:5432/db"
+    created = []
+
+    class FakeEngine:
+        def __init__(self, target):
+            from sqlalchemy.engine.url import make_url
+
+            self.url = make_url(target)
+
+        def dispose(self):
+            pass
+
+    monkeypatch.setattr(
+        module, "create_engine", lambda target, **kw: created.append(target) or FakeEngine(target)
+    )
+
+    first = module.get_engine(url)
+    second = module.get_engine(url)
+    assert first is second
+    assert len(created) == 1
+
+
+def test_switching_url_disposes_the_old_pool(monkeypatch):
+    """A genuine URL change must release the old connections, not orphan them."""
+    import src.storage.db as module
+
+    monkeypatch.setattr(module, "_ENGINE", None)
+    monkeypatch.setattr(module, "_ENGINE_URL", None)
+
+    disposed = []
+
+    class FakeEngine:
+        def __init__(self, target):
+            from sqlalchemy.engine.url import make_url
+
+            self.url = make_url(target)
+            self._target = target
+
+        def dispose(self):
+            disposed.append(self._target)
+
+    monkeypatch.setattr(module, "create_engine", lambda target, **kw: FakeEngine(target))
+
+    module.get_engine("sqlite:///first.db")
+    module.get_engine("sqlite:///second.db")
+    assert disposed == ["sqlite:///first.db"]
