@@ -215,6 +215,22 @@ python -m scripts.bootstrap_db
 MLFLOW_TRACKING_URI=http://localhost:5001 python -m src.models.train --source offline
 ```
 
+### Live ingestion: what is actually verified
+
+After the pool leak was fixed, the poller ran unattended and derived **84,736
+proxy station-hours across 13 distinct hours** — real demand estimates from the
+live feed, end to end, with no human involvement.
+
+It is **not** continuous 24/7, and the reason is the host rather than the code:
+this runs on a laptop that sleeps and gets shut down, and every hour with fewer
+than 50% of its expected samples is deliberately discarded rather than written
+as a partial hour. On always-on infrastructure the same code would fill every
+hour; here it fills the hours the machine is awake for.
+
+Stated precisely, so nothing is oversold: **the pipeline polls the live GBFS feed
+every 60 seconds, derives hourly demand proxies automatically, and drops hours it
+cannot cover honestly.**
+
 ### Pipeline liveness alerts
 
 Drift and error monitoring answer *"is the model still good?"*. Neither can
@@ -593,6 +609,15 @@ kind that stay silent:
 - **A retrain storm**: drift persists until a new model serves, so an hourly
   monitor queued a retrain every hour. Three had stacked up before the cooldown
   was added.
+- **A connection-pool leak that masqueraded as a scheduling problem.** Ingestion
+  kept hanging for exactly 67 minutes at a time. I blamed Airflow, rewrote
+  ingestion as a standalone poller — and it hung for exactly 67 minutes too.
+  *That* was the clue: two unrelated orchestrators failing identically means the
+  orchestrator is not the cause. `get_engine()` compared its cache key with
+  `str(engine.url)`, which renders passwords as `***`, so the comparison never
+  matched its own input and **every call built a new engine and leaked the old
+  pool** — 39 idle connections against `max_connections=100`. The processes were
+  alive and blocked waiting for a connection, not starved of CPU.
 - **The auto-retrain could never finish.** `retrain_dag` defaults to `blend`,
   which the 33-day gap makes unusable, so all four early runs failed. An
   automatically triggered retrain that always aborts is not a closed loop; it
