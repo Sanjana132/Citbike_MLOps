@@ -275,6 +275,13 @@ ingestion:
   # At ~2,460 stations x 60 samples an hour they accumulate ~3.5M rows a day,
   # so they are pruned once the hours they feed have been derived.
   snapshot_retention_days: 3
+  # Overrides the days setting when set. Intended for small hosted databases:
+  # the free Neon/Supabase tiers cap at 500 MB and three days of snapshots
+  # measured 505 MB on its own. Derivation only looks back a few hours, and the
+  # durable output is hourly_departures, so a short window loses nothing.
+  # Set SNAPSHOT_RETENTION_HOURS in the environment to override (the GitHub
+  # Actions deployment sets it to 6). Empty means "use the days value above".
+  snapshot_retention_hours: ${SNAPSHOT_RETENTION_HOURS:-}
   # --- Demand proxy correction parameters (see derive_departures.py) ---
   # These bound the inventory-delta proxy. They do NOT make it true demand.
   proxy:

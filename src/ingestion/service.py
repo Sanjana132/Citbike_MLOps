@@ -111,8 +111,19 @@ def _refresh_stations(config: Config) -> None:
         logger.error("Station metadata refresh failed: %s", exc)
 
 
-def run_poller(config: Config | None = None, *, max_iterations: int | None = None) -> PollerState:
-    """Poll the feed forever. ``max_iterations`` bounds it for tests."""
+def run_poller(
+    config: Config | None = None,
+    *,
+    max_iterations: int | None = None,
+    max_seconds: float | None = None,
+) -> PollerState:
+    """Poll the feed until stopped.
+
+    ``max_iterations`` bounds it for tests. ``max_seconds`` bounds it by wall
+    clock, which is what the GitHub Actions deployment uses: a scheduled job
+    cannot run forever, so it samples for a few minutes and exits, and the next
+    cron firing continues the sequence. Same loop either way.
+    """
     cfg = config or load_config()
     from src.ingestion.gbfs_client import GBFSClient
 
@@ -148,8 +159,12 @@ def run_poller(config: Config | None = None, *, max_iterations: int | None = Non
     next_derive = start + derive_every
     next_station_refresh = start + station_refresh_every
     iterations = 0
+    hard_deadline = start + max_seconds if max_seconds else None
 
     while not stop.is_set():
+        if hard_deadline is not None and time.monotonic() >= hard_deadline:
+            logger.info("Reached the %.0fs run budget; exiting cleanly", max_seconds)
+            break
         now = time.monotonic()
         if now < next_poll:
             stop.wait(min(next_poll - now, 5.0))
@@ -193,10 +208,39 @@ def run_poller(config: Config | None = None, *, max_iterations: int | None = Non
 
 
 def main() -> None:
+    """CLI entry point.
+
+    Runs forever by default (the container deployment). ``--max-seconds`` makes
+    it a bounded one-shot for schedulers that cannot host a daemon, such as
+    GitHub Actions.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Poll the GBFS feed")
+    parser.add_argument(
+        "--max-seconds",
+        type=float,
+        default=None,
+        help="Exit after this many seconds instead of running forever",
+    )
+    parser.add_argument(
+        "--derive-on-exit",
+        action="store_true",
+        help="Run one derivation before exiting, so a short run still produces hourly rows",
+    )
+    args = parser.parse_args()
+
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s"
     )
-    run_poller()
+    config = load_config()
+    state = run_poller(config, max_seconds=args.max_seconds)
+
+    if args.derive_on_exit:
+        # A 4-minute run would otherwise exit before its derive interval
+        # elapsed, so the snapshots it collected would sit unprocessed.
+        _derive_once(config, state)
+        logger.info("Final state: %s", state.summary())
 
 
 if __name__ == "__main__":

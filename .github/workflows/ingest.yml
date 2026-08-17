@@ -1,0 +1,114 @@
+# Continuous-ish ingestion on GitHub Actions, writing to a hosted Postgres
+# (Neon or Supabase free tier). Zero infrastructure to run or pay for.
+#
+# SETUP (once):
+#   1. Create a free Postgres at neon.tech or supabase.com.
+#   2. Copy its connection string. It must be the SQLAlchemy form:
+#        postgresql+psycopg2://USER:PASSWORD@HOST/DB?sslmode=require
+#      Neon and Supabase both hand you "postgresql://..." - insert "+psycopg2".
+#   3. Repo -> Settings -> Secrets and variables -> Actions -> New secret:
+#        DATABASE_URL = <that string>
+#   4. Run the "Initialise database schema" workflow once (Actions tab -> Run
+#      workflow). Nothing works until the tables exist.
+#   5. This workflow then runs on its own.
+#
+# HONEST LIMITS - read before relying on this:
+#   * GitHub's cron minimum is 5 minutes, and scheduled runs are best-effort:
+#     they are queued on shared infrastructure and are routinely delayed by
+#     5-15 minutes, sometimes skipped entirely under load. This is not a
+#     substitute for a always-on host; it is the free option.
+#   * Each run therefore samples for ~4 minutes at 60s intervals rather than
+#     polling once, which recovers most of the 60-second cadence WITHIN a run.
+#     Shorter intervals matter: the longer the gap, the more departures and
+#     returns cancel out unseen inside it.
+#   * Hours that miss the 50% sample-coverage guard are discarded rather than
+#     written as partial hours, so delayed crons cost whole hours of data.
+#   * Free Postgres tiers cap around 500 MB. Snapshot retention is therefore cut
+#     to hours instead of days - see SNAPSHOT_RETENTION_HOURS below.
+#   * Scheduled workflows are disabled automatically after 60 days of repository
+#     inactivity. A commit re-enables them.
+
+name: Ingest GBFS
+
+on:
+  schedule:
+    # Every 5 minutes - GitHub's minimum granularity.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: "How long to sample for, in seconds"
+        required: false
+        default: "240"
+
+# Never let two ingestion runs overlap: they would write the same snapshot
+# timestamps and fight over the same rows. A late run is simply dropped.
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    # Generous ceiling relative to the ~4-minute sampling window, so a slow
+    # feed cannot leave the job hanging and burning minutes.
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ingestion dependencies
+        # Deliberately not the full requirements.txt: ingestion needs no torch,
+        # LightGBM, MLflow or Streamlit, and installing them would add minutes
+        # to a job that runs 288 times a day.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests SQLAlchemy psycopg2-binary PyYAML pyarrow
+
+      - name: Poll the feed and derive hourly demand proxies
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+          # Free tiers cap near 500 MB and three days of snapshots measured
+          # 505 MB on its own. Only a few hours are ever needed: derivation
+          # looks back 3 hours and the durable output is hourly_departures.
+          SNAPSHOT_RETENTION_HOURS: "6"
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set. See the setup steps in this workflow file."
+            exit 1
+          fi
+          python -m src.ingestion.service \
+            --max-seconds "${{ github.event.inputs.duration_seconds || 240 }}" \
+            --derive-on-exit
+
+      - name: Report what landed
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          from sqlalchemy import create_engine, text
+          import os
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              for label, query in [
+                  ("distinct snapshots (last hour)",
+                   "SELECT COUNT(DISTINCT snapshot_ts) FROM status_snapshots "
+                   "WHERE snapshot_ts > NOW() - INTERVAL '1 hour'"),
+                  ("proxy hours derived (last 24h)",
+                   "SELECT COUNT(DISTINCT hour_ts) FROM hourly_departures "
+                   "WHERE label_source='gbfs_proxy' AND hour_ts > NOW() - INTERVAL '24 hours'"),
+                  ("latest proxy hour",
+                   "SELECT COALESCE(MAX(hour_ts)::text, 'none') FROM hourly_departures "
+                   "WHERE label_source='gbfs_proxy'"),
+              ]:
+                  print(f"{label}: {connection.execute(text(query)).scalar()}")
+          PY

@@ -195,7 +195,8 @@ def derive_and_store_proxy_departures(
         from src.storage.db import prune_status_snapshots
 
         pruned = prune_status_snapshots(
-            int(cfg.get_path("ingestion.snapshot_retention_days", 3))
+            float(cfg.get_path("ingestion.snapshot_retention_days", 3) or 0),
+            retention_hours=cfg.get_path("ingestion.snapshot_retention_hours"),
         )
     except Exception as exc:  # noqa: BLE001 - retention is housekeeping, not critical
         logger.warning("Could not prune old snapshots: %s", exc)

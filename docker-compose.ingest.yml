@@ -1,0 +1,103 @@
+# Ingestion-only stack, for continuous 24/7 collection on a small host.
+#
+#   docker compose -f docker-compose.ingest.yml up -d
+#
+# Only two services need to run continuously: the poller and the database it
+# writes to. Training, serving, MLflow and Airflow are all on-demand and can stay
+# on a laptop or a bigger box - none of them needs to be awake at 3am for the
+# data to keep arriving.
+#
+# Measured footprint of exactly these two services:
+#   ingestor  ~162 MB RAM, ~0.01% CPU
+#   postgres  ~243 MB RAM, ~0.84% CPU
+#   disk      ~1 GB steady state (3-day snapshot retention prunes the rest)
+#
+# So this runs on the smallest instance any provider sells, including
+# always-free tiers. The full 8-service stack needs ~3.5 GB and is a different
+# sizing conversation.
+
+name: citibike-ingest
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: citibike-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-citibike}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-citibike}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres-init/00-create-mlflow-db.sql:/docker-entrypoint-initdb.d/00-create-mlflow-db.sql:ro
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    # Not published by default. Opening 5432 to the internet is how a database
+    # gets found and drained; use an SSH tunnel or a private network to reach it
+    # from a training host.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-citibike} -d ${POSTGRES_DB:-citibike}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    container_name: citibike-ingestor
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-citibike}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-citibike}
+      CITIBIKE_CONFIG: /app/config/config.yaml
+      CITIBIKE_DATA_DIR: /app/data
+      PYTHONPATH: /app
+      # Optional: alerts if the pipeline stalls. Without SMTP configured the
+      # service logs what it would have sent rather than claiming a delivery.
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_SENDER: ${SMTP_SENDER:-}
+      ALERT_EMAIL_RECIPIENTS: ${ALERT_EMAIL_RECIPIENTS:-}
+    volumes:
+      - ingest-data:/app/data
+    command: ["python", "-m", "src.ingestion.service"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    # The poller is a loop with no HTTP surface, so liveness is judged on it
+    # actually writing rows - a process can be "running" and stuck, which is
+    # exactly what a leaked connection pool looked like here.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >-
+          python -c "
+          import sys;
+          from src.storage.db import get_engine;
+          from sqlalchemy import text;
+          from datetime import datetime, timedelta, UTC;
+          e=get_engine();
+          c=e.connect();
+          latest=c.execute(text('SELECT MAX(snapshot_ts) FROM status_snapshots')).scalar();
+          c.close();
+          sys.exit(0 if latest and latest.replace(tzinfo=UTC) > datetime.now(UTC)-timedelta(minutes=15) else 1)
+          "
+      interval: 300s
+      timeout: 30s
+      retries: 3
+      start_period: 180s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  postgres-data:
+  ingest-data:

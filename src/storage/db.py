@@ -260,26 +260,43 @@ def write_model_metrics(record: dict, engine: Engine | None = None) -> None:
 # Reads
 # --------------------------------------------------------------------------
 
-def prune_status_snapshots(retention_days: int, engine: Engine | None = None) -> int:
+def prune_status_snapshots(
+    retention_days: float = 0, engine: Engine | None = None, *, retention_hours: float | None = None
+) -> int:
     """Delete snapshots older than the retention window.
 
     Snapshots are raw material for the hourly proxy, not a long-term record:
     once the hours they feed have been derived into ``hourly_departures`` they
-    are dead weight. At ~2,460 stations sampled every minute they accumulate
-    roughly 3.5M rows a day, so without pruning the table would dominate the
-    database within a week.
+    are dead weight. At ~2,500 stations sampled every minute they accumulate
+    roughly 3.5M rows a day - measured at 505 MB for three days - so without
+    pruning the table would dominate the database within a week.
+
+    ``retention_hours`` takes precedence and exists for small hosted databases:
+    the free Neon and Supabase tiers cap at 500 MB, which three days of
+    snapshots exceeds on its own. Only a few hours are ever needed, since
+    derivation looks back a few hours and the durable output is
+    ``hourly_departures``.
     """
-    if retention_days <= 0:
+    # Values may arrive from the environment as strings (or as an empty string
+    # when the variable is unset), so coerce rather than compare types.
+    def _as_float(value: object) -> float:
+        try:
+            return float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 0.0
+
+    hours = _as_float(retention_hours) or _as_float(retention_days) * 24
+    if hours <= 0:
         return 0
     engine = engine or get_engine()
-    cutoff = datetime.now(tz=UTC) - timedelta(days=retention_days)
+    cutoff = datetime.now(tz=UTC) - timedelta(hours=hours)
     with engine.begin() as connection:
         deleted = connection.execute(
             text("DELETE FROM status_snapshots WHERE snapshot_ts < :cutoff"),
             {"cutoff": cutoff},
         ).rowcount
     if deleted:
-        logger.info("Pruned %d status snapshots older than %d days", deleted, retention_days)
+        logger.info("Pruned %d status snapshots older than %.1f hours", deleted, hours)
     return int(deleted or 0)
 
 

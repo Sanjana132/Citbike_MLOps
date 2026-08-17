@@ -1,0 +1,88 @@
+# One-time schema bootstrap for the hosted database.
+#
+# Run this once from the Actions tab before enabling ingestion - the poller
+# writes into tables that must already exist.
+#
+# Deliberately manual (`workflow_dispatch` only). Schema creation is not
+# something that should fire on a schedule or on push.
+
+name: Initialise database schema
+
+on:
+  workflow_dispatch:
+    inputs:
+      seed_stations:
+        description: "Also load current station metadata from the live GBFS feed"
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests SQLAlchemy psycopg2-binary PyYAML pyarrow
+
+      - name: Create tables
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL secret is not set."
+            exit 1
+          fi
+          python - <<'PY'
+          import logging
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+          from src.storage.db import get_engine, init_schema
+          # CREATE TABLE IF NOT EXISTS throughout, so this is safe to re-run.
+          init_schema(get_engine())
+          PY
+
+      - name: Seed station metadata
+        if: ${{ inputs.seed_stations }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import logging
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+          from src.ingestion.pipeline import ingest_station_information
+          print(ingest_station_information())
+          PY
+
+      - name: Confirm the schema
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              tables = connection.execute(text(
+                  "SELECT table_name FROM information_schema.tables "
+                  "WHERE table_schema='public' ORDER BY table_name"
+              )).scalars().all()
+          print("tables created:", ", ".join(tables))
+          expected = {"station_info", "status_snapshots", "hourly_departures",
+                      "predictions", "features", "model_metrics"}
+          missing = expected - set(tables)
+          raise SystemExit(f"missing tables: {sorted(missing)}") if missing else print("schema OK")
+          PY

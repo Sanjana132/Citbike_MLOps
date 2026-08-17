@@ -1,7 +1,7 @@
 # Citi Bike Demand Forecasting — a closed-loop MLOps platform
 
 ![Python](https://img.shields.io/badge/python-3.11-blue)
-![Tests](https://img.shields.io/badge/tests-171%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-174%20passing-brightgreen)
 ![Airflow](https://img.shields.io/badge/Airflow-2.10-017CEE)
 ![MLflow](https://img.shields.io/badge/MLflow-2.22-0194E2)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
@@ -21,7 +21,8 @@ without a human in the path.
 | **Accuracy** | Test MAE **20.27** — 56% better than seasonal-naive (46.11) |
 | **Serving** | FastAPI, **23 ms** median (down from ~310 ms) |
 | **Stack** | Airflow · MLflow · FastAPI · Postgres · Evidently · Streamlit · Docker Compose (8 services) |
-| **Quality** | **171 tests**, hermetic (verified with sockets blocked), ruff-clean, GitHub Actions CI |
+| **Quality** | **174 tests**, hermetic (verified with sockets blocked), ruff-clean, GitHub Actions CI |
+| **Hosting** | Runs locally on Docker Compose; free continuous ingestion via GitHub Actions + hosted Postgres ([guide](docs/DEPLOYMENT.md)) |
 
 **The part worth reading:** this README documents what *broke* as carefully as
 what works — a promotion that shipped a model 60% worse than the one it
