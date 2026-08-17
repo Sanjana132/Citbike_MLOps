@@ -45,6 +45,44 @@ Four limits worth knowing before you rely on it:
 
 ---
 
+## ⚠️ Actions minutes: make the repository public first
+
+This is the constraint that decides whether the free route works at all.
+
+**Private repositories get 2,000 Actions minutes/month on GitHub Free. Public
+repositories are unlimited on standard runners.**
+
+Ingesting every 5 minutes costs far more than 2,000:
+
+| workflow | schedule | runs/month | ~min/run | **min/month** |
+|---|---|---|---|---|
+| Ingest | every 5 min | 8,640 | 6 | **~52,000** |
+| Monitor | every 6 hours | 120 | 3 | ~360 |
+| Retrain | weekly | 4 | 12 | ~48 |
+
+On a **private** repo ingestion would exhaust the whole allowance in about a
+day, then stop. (It stops rather than bills you — GitHub Free defaults to a $0
+spending limit — but stopped ingestion is exactly what this deployment exists to
+prevent.)
+
+**Two ways forward:**
+
+1. **Make the repository public** — unlimited minutes, and for a portfolio
+   project a public repo is worth more than a private one anyway. Secrets stay
+   secret: they live in Actions secrets, not in the code, and `.env` is
+   gitignored.
+2. **Keep it private and cut the cadence.** Even hourly (~4,300 min/month)
+   overruns 2,000. Realistically private means every 2–3 hours, which collects
+   far too little to clear the 50% hourly coverage guard — so most hours would
+   be discarded. If the repo must stay private, rent a small VM instead
+   (see the bottom of this page); it is $4–6/month and gives a true 60-second
+   cadence.
+
+Monitor and Retrain alone fit inside 2,000 minutes comfortably, so those two are
+safe on a private repo even without ingestion.
+
+---
+
 ## Setup, once
 
 ### 1. Create a free Postgres
@@ -99,6 +137,35 @@ distinct snapshots (last hour): 12
 proxy hours derived (last 24h): 19
 latest proxy hour: 2026-08-17 21:00:00
 ```
+
+---
+
+## The other two workflows
+
+Once ingestion is collecting, two more scheduled workflows close the loop in the
+cloud:
+
+**Monitor** (every 6 hours) — checks pipeline liveness and emails if ingestion
+has stalled, then evaluates rolling MAE and Evidently drift, writing the verdict
+to `model_metrics`. Cheap enough to leave on permanently.
+
+**Retrain** (weekly) — trains on the live proxy labels, runs champion/challenger
+with as-served scoring, and promotes only a genuine winner. It exits early and
+harmlessly until roughly 840 hours of proxy data have accumulated; that is
+expected for the first few weeks.
+
+One honest limit on Retrain: MLflow's **backend** store is the hosted Postgres,
+so runs, metrics, model versions and the `@production` alias persist — which is
+what champion/challenger needs. **Artifacts do not.** A free deployment has no
+object store, so the model binary is uploaded as a workflow artifact
+(downloadable for 90 days) instead. The workflow can therefore decide which
+model *should* serve and hand you the file, but it cannot deploy one itself.
+Serving still runs from the local stack, or from a host with a real artifact
+store.
+
+It trains LightGBM only. The LSTM takes ~14 minutes and, scored through its real
+serving path, is worse than the naive baseline — so weekly Actions minutes spent
+on it would buy nothing.
 
 ---
 

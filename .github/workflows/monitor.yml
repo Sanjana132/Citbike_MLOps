@@ -1,0 +1,98 @@
+# Scheduled monitoring against the hosted database.
+#
+# Answers two questions the ingestion workflow cannot:
+#   1. Is the pipeline still alive? (liveness -> email alert)
+#   2. Has the model degraded or the data drifted? (rolling MAE + Evidently)
+#
+# Cheap by design: a few minutes per run, four runs a day. See docs/DEPLOYMENT.md
+# for the Actions-minutes budget - this fits comfortably inside the free
+# allowance even on a private repository, unlike ingestion.
+
+name: Monitor
+
+on:
+  schedule:
+    # Every 6 hours. More frequent adds little: drift moves slowly, and the
+    # retrain cooldown is 6 hours anyway, so hourly checks would mostly be
+    # suppressed by it.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        # Evidently and its numeric stack are needed for drift; no torch or
+        # LightGBM, since nothing is trained here.
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn requests SQLAlchemy psycopg2-binary \
+                      PyYAML pyarrow holidays "evidently>=0.7,<0.8" "mlflow>=2.19,<3"
+
+      - name: Check pipeline liveness
+        # Runs first and independently: a stalled pipeline is an operational
+        # failure that retraining cannot fix, and it makes the drift and error
+        # signals meaningless rather than alarming. Continues on failure so a
+        # stalled pipeline still gets its model checks attempted.
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          ALERT_EMAIL_RECIPIENTS: ${{ secrets.ALERT_EMAIL_RECIPIENTS }}
+        run: |
+          python - <<'PY'
+          import logging, sys
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+          from src.monitoring.liveness import alert_on_stalled_pipeline
+          report = alert_on_stalled_pipeline()
+          for check in report.checks:
+              print(f"  {check.detail}")
+          if not report.healthy:
+              print("::warning::Pipeline liveness check failed - see detail above")
+              sys.exit(1)
+          PY
+
+      - name: Evaluate accuracy and drift
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          MLFLOW_TRACKING_URI: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import logging
+          logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+          from src.monitoring.pipeline import run_monitoring_cycle
+          outcome = run_monitoring_cycle()
+          print("\n=== MONITORING VERDICT ===")
+          print("should_retrain:", outcome.should_retrain)
+          print("summary       :", outcome.summary())
+          print("accuracy      :", outcome.accuracy)
+          drift = {k: v for k, v in outcome.drift.items() if k != "drifted_features"}
+          print("drift         :", drift)
+          if outcome.drift.get("drifted_features"):
+              print("drifted       :", outcome.drift["drifted_features"][:10])
+          # Surfaced in the Actions UI rather than only in logs.
+          if outcome.should_retrain:
+              print(f"::warning::Retraining recommended - {outcome.summary()}")
+          PY

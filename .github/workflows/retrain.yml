@@ -1,0 +1,148 @@
+# Scheduled retraining against the hosted database.
+#
+# Trains on the live proxy labels the ingestion workflow has been collecting,
+# runs champion/challenger, and promotes only a genuine winner - the same
+# promotion rule the local stack uses, including as-served scoring.
+#
+# WHAT IS AND IS NOT PERSISTED
+# MLflow's backend store is the hosted Postgres, so runs, metrics, model
+# versions and the @production alias all survive between workflow runs - which
+# is what champion/challenger needs, since promotion compares against the
+# champion's recorded holdout metric.
+#
+# Artifacts (the model binary itself) are NOT persisted to object storage; a
+# free deployment has nowhere to put them. They are uploaded as a workflow
+# artifact instead, downloadable for 90 days. So this workflow can decide which
+# model *should* serve, and hand you the file, but it cannot itself deploy one.
+# Serving still runs from the local stack or a host with an artifact store.
+#
+# LightGBM only. The LSTM takes ~14 minutes on this hardware and, scored through
+# its real serving path, is worse than the naive baseline - so spending Actions
+# minutes on it every week would buy nothing. Re-enable via `--candidates` once
+# its sequence-serving path is rebuilt.
+
+name: Retrain
+
+on:
+  schedule:
+    # Weekly, off-peak Sunday. Retraining more often than the data changes is
+    # just compute: the monitor's cooldown is 6 hours and drift moves slowly.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      source:
+        description: "Label source: db (live proxy) or blend (needs cached CSVs)"
+        required: false
+        default: "db"
+      promote:
+        description: "Allow promotion to @production"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: retrain
+  cancel-in-progress: false
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install training dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy scikit-learn lightgbm requests SQLAlchemy \
+                      psycopg2-binary PyYAML pyarrow holidays "mlflow>=2.19,<3"
+
+      - name: Check there is enough data to train on
+        # Fail early and legibly. Training aborts anyway if a split lands in a
+        # gap, but a clear message here beats a stack trace 3 minutes in.
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import os, sys
+          from sqlalchemy import create_engine, text
+          engine = create_engine(os.environ["DATABASE_URL"])
+          with engine.connect() as connection:
+              hours = connection.execute(text(
+                  "SELECT COUNT(DISTINCT hour_ts) FROM hourly_departures "
+                  "WHERE label_source='gbfs_proxy'"
+              )).scalar() or 0
+          # test 336h + validation 168h + a training window worth having.
+          needed = 336 + 168 + 336
+          print(f"proxy hours available: {hours} (need ~{needed})")
+          if hours < needed:
+              print(
+                  f"::warning::Only {hours} hours of live proxy data - need about "
+                  f"{needed}. Let ingestion run longer; this is expected early on."
+              )
+              sys.exit(78)  # neutral: not a failure, just not yet
+          PY
+
+      - name: Train and run champion/challenger
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # Postgres backend keeps runs, metrics and the registry across runs.
+          MLFLOW_TRACKING_URI: ${{ secrets.DATABASE_URL }}
+          CITIBIKE_CONFIG: config/config.yaml
+          PYTHONPATH: ${{ github.workspace }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+          ALERT_EMAIL_RECIPIENTS: ${{ secrets.ALERT_EMAIL_RECIPIENTS }}
+        run: |
+          python -m src.models.train \
+            --source "${{ github.event.inputs.source || 'db' }}" \
+            --candidates lightgbm \
+            ${{ github.event.inputs.promote == 'false' && '--no-promote' || '' }}
+
+      - name: Upload the trained model
+        # The only way out for the binary: there is no artifact store in a free
+        # deployment, so the file is attached to the workflow run.
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-${{ github.run_number }}
+          path: |
+            mlruns/
+            mlartifacts/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Report the outcome
+        if: always()
+        env:
+          MLFLOW_TRACKING_URI: ${{ secrets.DATABASE_URL }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import os
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          mlflow.set_tracking_uri(os.environ["MLFLOW_TRACKING_URI"])
+          client = MlflowClient()
+          try:
+              version = client.get_model_version_by_alias(
+                  "citibike-demand-forecaster", "production"
+              )
+              run = client.get_run(version.run_id)
+              print(f"production model: version {version.version} "
+                    f"({version.tags.get('model_kind', 'unknown')})")
+              print(f"  as-served test MAE: {run.data.metrics.get('served_mae')}")
+              print(f"  reason: {version.tags.get('promotion_reason', 'n/a')}")
+          except Exception as exc:
+              print(f"no production model yet: {exc}")
+          PY
